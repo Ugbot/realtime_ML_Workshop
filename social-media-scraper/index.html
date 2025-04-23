@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mastodon Posts</title>
+    <style>
+        #postContainer {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+        .post {
+            border: 1px solid #333;
+            margin-bottom: 10px;
+            padding: 10px;
+            width: 100%;
+            max-width: 500px;
+        }
+    </style>
+</head>
+<body>
+    <div id="postContainer"></div>
+    <script>
+        const source = new EventSource('http://localhost:8000/sse');
+
+        // const test_source = new EventSource('http://localhost:8000/testsse');
+        // test_source.onmessage = function(event) {
+        //     console.log(event.data);
+        // };
+
+        source.onmessage = function(event) {
+            const post = JSON.parse(event.data);
+        const postElement = document.createElement('div');
+        postElement.className = 'post';
+
+        const postContent = document.createElement('div');
+        postContent.innerHTML = post.content;
+
+        const postAuthor = document.createElement('p');
+        postAuthor.textContent = 'Author: ' + post.account.username;
+
+        postElement.appendChild(postContent);
+        postElement.appendChild(postAuthor);
+
+        document.getElementById('postContainer').appendChild(postElement);
+        };
+    </script>
+</body>
+</html>
