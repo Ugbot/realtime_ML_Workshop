@@ -1,0 +1,9 @@
+confluent-kafka
+dash
+dash-core-components
+dash-html-components
+dash-bootstrap-components
+dash-cytoscape
+dash-cytoscape-components
+aiokafka
+asyncio

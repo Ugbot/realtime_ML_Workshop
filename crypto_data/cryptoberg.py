@@ -24,7 +24,7 @@ ticker_data = {}  # e.g. { "BTC-USD": {"ticks": [...], "latest": {...}}, ... }
 lock = Lock()
 
 # Kafka config
-KAFKA_BOOTSTRAP = "localhost:9092"
+KAFKA_BOOTSTRAP = "localhost:19092"
 KAFKA_TOPIC = "coinbase-ticker"
 KAFKA_GROUP_ID = "aiokafka-group"
 KAFKA_SIGNALS_TOPIC = "trading-signals"
@@ -459,5 +459,5 @@ if __name__ == "__main__":
     consumer_thread = threading.Thread(target=start_consumer_loop, daemon=True)
     consumer_thread.start()
 
-    print("[*] Starting Dash app on http://127.0.0.1:8050")
-    app.run_server(debug=True)
+    print("[*] Starting Dash app on http://127.0.0.1:8055")
+    app.run_server(debug=True, port=8055)

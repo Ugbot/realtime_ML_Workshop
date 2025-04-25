@@ -3,33 +3,23 @@ import multiprocessing
 from time import sleep
 
 from aiokafka import AIOKafkaProducer
-from aiokafka.helpers import create_ssl_context
 
 from mastodon_types import MastodonPost
 from mastodon_fetcher import MastodonFetcher
 
-# Kafka server configuration
-kafka_bootstrap_servers = "zilla-kafka-devrel-ben.aivencloud.com:15545"
+# Kafka server configuration - Updated to local Redpanda
+kafka_bootstrap_servers = "localhost:19092"
 
 # kafka_topic = "complete-json"
-kafka_topic = "easy-timestamps"
-
-context = create_ssl_context(
-    cafile="demo_keys/ca.pem",
-    certfile="demo_keys/service.cert",
-    keyfile="demo_keys/service.key",
-)
-
+kafka_topic = "easy-timestamps" # Or choose another topic name
 
 # Example callback function
 async def handle_message(content: MastodonPost, producer):
 
     print(f"Received message: {content.json()}")
 
-
     # Send message to Kafka topic
     await producer.send_and_wait(kafka_topic, value=content.json().encode("utf-8"))
-
 
 # Define a list of Mastodon servers
 my_servers = [
@@ -38,12 +28,12 @@ my_servers = [
     "https://mastodon.cloud"
 ]
 
-
 # Create a function to start a fetcher process for a server
 def start_fetcher(server):
-    # Create Kafka producer
+    # Create Kafka producer for local PLAINTEXT Redpanda
     async def run():
-        producer = AIOKafkaProducer(bootstrap_servers=kafka_bootstrap_servers, security_protocol='SSL', ssl_context=context)
+        # Removed security_protocol and ssl_context for PLAINTEXT
+        producer = AIOKafkaProducer(bootstrap_servers=kafka_bootstrap_servers)
         await producer.start()
         try:
             fetcher = MastodonFetcher(server, 10,
@@ -64,7 +54,7 @@ processes = []
 
 if __name__ == '__main__':
     for Mastodon_server in my_servers:
-        sleep(1)
+        sleep(1) # Add a small delay between starting processes
         process = multiprocessing.Process(target=start_fetcher, args=(Mastodon_server,))
         process.start()
         processes.append(process)
