@@ -1,437 +1,645 @@
 #!/usr/bin/env python3
 """
-Stream Coinbase Advanced-Trade tickers through an asyncio websocket.
+Stream Coinbase Advanced‑Trade tickers through an asyncio websocket.
 Depending on flags, either pipe raw JSON to Kafka, append to a Parquet file,
 or read from the Parquet file to Kafka.
 
 Modes:
-  -k : Stream Coinbase -> Kafka (default)
-  -F : Stream Coinbase -> Parquet file
-  -FK: Read Parquet file -> Kafka
+  -k   : Stream Coinbase → Kafka (default)
+  -F   : Stream Coinbase → Parquet file (row‑group streaming)
+  -FK  : Read Parquet file → Kafka
+  -J   : Stream Coinbase → JSON Lines file
+  -JK  : Read JSON Lines file → Kafka
+  -S   : Stream Coinbase → SQLite database
+  -SK  : Read SQLite database → Kafka
+  -PF  : Print Parquet path + first 100 rows, then exit
 """
 
-import asyncio
+from __future__ import annotations
+
 import argparse
+import asyncio
 import json
-import ssl
-import time
-import sys
-import functools
 import logging
+import ssl
+import sys
+import time
 from pathlib import Path
-from typing import NoReturn, List, Dict, Any
+from typing import Any, Dict, List, NoReturn, Optional
 
 import certifi
-import websockets                       # pip install websockets
-import pandas as pd                     # pip install pandas pyarrow
-import pyarrow                          # pip install pyarrow
-from confluent_kafka import Producer    # pip install confluent-kafka
+import pandas as pd                    # used for reading / printing only
+import pyarrow as pa                   # ← proper pyarrow import
+import pyarrow.parquet as pq
+import websockets                      # pip install websockets
+from confluent_kafka import Producer   # pip install confluent‑kafka
+from pydantic import BaseModel, Field, field_validator
+import sqlite3
 
-# --- Configuration ---
+# ───────────────────────────────────────── Configuration ──
 WS_URL = "wss://advanced-trade-ws.coinbase.com"
 KAFKA_TOPIC = "coinbase-ticker"
-PARQUET_FILE = Path("./coinbase_ticker_data.parquet")
-# Set batch size for writing to Parquet
-PARQUET_BATCH_SIZE = 50
-# List of product IDs to subscribe to
+PARQUET_TOPIC = "coinbase-ticker"
+PARQUET_BATCH_SIZE = 50               # rows per row‑group
+# Default filenames (used if -o is not provided)
+DEFAULT_PARQUET_FILE = Path("./coinbase_ticker_data.parquet")
+DEFAULT_JSONL_FILE = Path("./coinbase_ticker_data.jsonl")
+DEFAULT_SQLITE_FILE = Path("./coinbase_ticker_data.db")
 PRODUCT_IDS = [
     "BTC-USD", "ETH-USD", "DOGE-USD", "XRP-USD",
     "LTC-USD", "BCH-USD", "ADA-USD", "SOL-USD",
     "DOT-USD", "LINK-USD", "XLM-USD", "UNI-USD",
     "ALGO-USD", "MATIC-USD",
 ]
-# --- End Configuration ---
+# ─────────────────────────────────────────────────────────
 
+# ─────────────────────────────────── Pydantic models ──
+class TickerData(BaseModel):
+    type: str
+    product_id: str
+    price: float
+    volume_24_h: float
+    low_24_h: float
+    high_24_h: float
+    low_52_w: str
+    high_52_w: str
+    price_percent_chg_24_h: float
+    best_bid: float
+    best_ask: float
+    best_bid_quantity: float
+    best_ask_quantity: float
+    last_size: Optional[float] = None
+    volume_3d: Optional[float] = None
+    open_24h: Optional[float] = None
+    parent_timestamp: str = Field(default="")
+    parent_sequence_num: Optional[int] = None
+
+    @field_validator(
+        "price",
+        "volume_24_h",
+        "low_24_h",
+        "high_24_h",
+        "price_percent_chg_24_h",
+        "best_bid",
+        "best_ask",
+        "best_bid_quantity",
+        "best_ask_quantity",
+        "last_size",
+        "volume_3d",
+        "open_24h",
+        mode="before",
+    )
+    def _num(cls, v):
+        if v in (None, ""):  # accept None / empty strings
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            logging.warning("Could not convert %r to float; setting to None", v)
+            return None
+
+
+class Ticker(BaseModel):
+    type: str
+    tickers: List[TickerData]
+
+
+class Event(BaseModel):
+    channel: str
+    client_id: Optional[str] = None
+    timestamp: str
+    sequence_num: Optional[int] = None
+    events: List[Ticker]
+
+# ─────────────────────────────────────────────── Arrow schema ──
+PARQUET_SCHEMA = pa.schema([
+    pa.field("type", pa.string()),
+    pa.field("product_id", pa.string()),
+    pa.field("price", pa.float64()),
+    pa.field("volume_24_h", pa.float64()),
+    pa.field("low_24_h", pa.float64()),
+    pa.field("high_24_h", pa.float64()),
+    pa.field("low_52_w", pa.string()),
+    pa.field("high_52_w", pa.string()),
+    pa.field("price_percent_chg_24_h", pa.float64()),
+    pa.field("best_bid", pa.float64()),
+    pa.field("best_ask", pa.float64()),
+    pa.field("best_bid_quantity", pa.float64()),
+    pa.field("best_ask_quantity", pa.float64()),
+    pa.field("last_size", pa.float64()),
+    pa.field("volume_3d", pa.float64()),
+    pa.field("open_24h", pa.float64()),
+    pa.field("parent_timestamp", pa.string()),
+    pa.field("parent_sequence_num", pa.int64()),
+])
+
+# ────────────────────────────────────────── SQLite setup ──
+_SQLITE_TABLE_NAME = "coinbase_ticker"
+_SQLITE_SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS {_SQLITE_TABLE_NAME} (
+    type TEXT,
+    product_id TEXT,
+    price REAL,
+    volume_24_h REAL,
+    low_24_h REAL,
+    high_24_h REAL,
+    low_52_w TEXT,
+    high_52_w TEXT,
+    price_percent_chg_24_h REAL,
+    best_bid REAL,
+    best_ask REAL,
+    best_bid_quantity REAL,
+    best_ask_quantity REAL,
+    last_size REAL,
+    volume_3d REAL,
+    open_24h REAL,
+    parent_timestamp TEXT,
+    parent_sequence_num INTEGER,
+    -- Add a primary key for potential indexing/querying
+    id INTEGER PRIMARY KEY AUTOINCREMENT
+);
+"""
+_SQLITE_INSERT_SQL = f"INSERT INTO {_SQLITE_TABLE_NAME} (type, product_id, price, volume_24_h, low_24_h, high_24_h, low_52_w, high_52_w, price_percent_chg_24_h, best_bid, best_ask, best_bid_quantity, best_ask_quantity, last_size, volume_3d, open_24h, parent_timestamp, parent_sequence_num) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+def _get_sqlite_conn(db_path: Path) -> sqlite3.Connection:
+    """Get SQLite connection and create table if needed."""
+    conn = sqlite3.connect(db_path, check_same_thread=False) # Allow use in async context (with care)
+    try:
+        conn.execute(_SQLITE_SCHEMA)
+        conn.commit()
+        logging.debug("Ensured table %s exists in %s", _SQLITE_TABLE_NAME, db_path)
+    except sqlite3.Error as e:
+        logging.error("SQLite error during table creation: %s", e)
+        conn.close() # Close connection if table creation fails
+        raise
+    return conn
+
+# Global path, potentially updated by CLI args
+_output_file_path: Path | None = None # Will be set in main()
+
+# ───────────────────────────────────────── SSL + logging ──
 ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-# Initialize producer to None, create only if needed
-producer: Producer | None = None
-
-SUBSCRIBE_MSG = json.dumps(
-    {
-        "type": "subscribe",
-        "product_ids": PRODUCT_IDS,
-        "channel": "ticker",
-    }
-)
-
-# --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout) # Log to standard output
-    ]
+    format="%(asctime)s  %(levelname)-8s %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-# --- End Logging Setup ---
+
+# ───────────────────────────────────────── WebSocket sub msg ──
+SUBSCRIBE_MSG = json.dumps({
+    "type": "subscribe",
+    "product_ids": PRODUCT_IDS,
+    "channel": "ticker",
+})
+
+# ───────────────────────────────────────── Kafka producer ──
+producer: Producer | None = None
 
 def _get_producer() -> Producer:
-    """Creates or returns the existing Kafka producer."""
     global producer
     if producer is None:
-        logging.info("Initializing Kafka producer...")
+        logging.info("Initializing Kafka producer …")
         producer = Producer({"bootstrap.servers": "localhost:19092"})
     return producer
 
-
+# ────────────────────────────────────────── Mode 1: CB → Kafka ──
 async def stream_to_kafka() -> None:
-    """Connect to WebSocket, subscribe, forward every frame to Kafka."""
-    kafka_producer = _get_producer()
+    kafka = _get_producer()
     async with websockets.connect(WS_URL, ssl=ssl_ctx, ping_interval=20) as ws:
         await ws.send(SUBSCRIBE_MSG)
-        logging.info(f"Subscribed to ticker channel. Streaming to Kafka topic '{KAFKA_TOPIC}'...")
+        logging.info("Subscribed; relaying raw frames to Kafka topic '%s'", KAFKA_TOPIC)
 
         async for frame in ws:
-            try:
-                # Forward raw JSON to Kafka
-                kafka_producer.produce(KAFKA_TOPIC, value=frame.encode())
-                kafka_producer.poll(0)  # Non-blocking flush
-                # Optional: decode for logging
-                # data = json.loads(frame)
-                # logging.debug(f"Sent to Kafka: {data.get('product_id')} @ {data.get('price')}")
-            except json.JSONDecodeError:
-                logging.warning(f"Ignoring non-JSON frame: {frame[:100]}...")
-            except Exception as e:
-                logging.error(f"Error producing to Kafka: {e}")
+            kafka.produce(KAFKA_TOPIC, value=frame.encode())
+            kafka.poll(0)
+            kafka.flush()
 
-
+# ────────────────────────────────────────── Mode 2: CB → Parquet ──
 async def stream_to_parquet() -> None:
-    """Connect to WebSocket, subscribe, batch data, append to Parquet file."""
-    batch: List[Dict[str, Any]] = []
-    last_write_time = time.monotonic()
-    record_count = 0
-    # Check if the Parquet file already exists before starting
-    parquet_file_exists = PARQUET_FILE.exists()
-    if parquet_file_exists:
-        logging.info(f"Parquet file '{PARQUET_FILE}' already exists. Will append.")
-    else:
-        logging.info(f"Parquet file '{PARQUET_FILE}' does not exist. Will create on first batch.")
+    batch: list[TickerData] = []
+    writer: pq.ParquetWriter | None = None
+    last_write = time.monotonic()
+
+    if _output_file_path.exists():
+        logging.warning("%s already exists and will be **overwritten** when this run starts writing.", _output_file_path)
 
     async with websockets.connect(WS_URL, ssl=ssl_ctx, ping_interval=20) as ws:
         await ws.send(SUBSCRIBE_MSG)
-        logging.info(f"Subscribed to ticker channel. Appending data to '{PARQUET_FILE}'...")
+        logging.info("Subscribed; streaming row‑groups into %s", _output_file_path)
 
         try:
             async for frame in ws:
-                # logging.debug(f"Raw frame received: {frame[:200]}...") # Uncomment for verbose debugging
                 try:
-                    data = json.loads(frame)
-                    # Ensure it's ticker data and flatten the structure
-                    if data.get("channel") == "ticker" and "events" in data:
-                        for event in data.get("events", []):
-                            if event.get("type") == "update" and "tickers" in event:
-                                for ticker_data in event.get("tickers", []):
-                                    if ticker_data.get("type") == "ticker" and "product_id" in ticker_data:
-                                        # Add the actual ticker data dictionary to the batch
-                                        # Include timestamp and sequence_num from the parent message if needed
-                                        ticker_data['parent_timestamp'] = data.get('timestamp')
-                                        ticker_data['parent_sequence_num'] = data.get('sequence_num')
-                                        batch.append(ticker_data)
-                                        record_count += 1
-                                        logging.debug(f"Added flattened record {record_count} ({ticker_data.get('product_id')}) to batch (current size: {len(batch)})")
-                            else:
-                                logging.debug(f"Ignoring event type '{event.get('type')}' or missing 'tickers' key in event: {event}")
-                    else:
-                        logging.debug(f"Ignoring message channel '{data.get('channel')}' or missing 'events' key. Data: {data}")
+                    evt = Event.model_validate_json(frame)
+                except Exception as err:  # includes JSON/Pydantic errors
+                    logging.debug("Parse error ignored: %s", err)
+                    continue
 
-                    current_time = time.monotonic()
-                    write_reason = None
-                    if len(batch) >= PARQUET_BATCH_SIZE:
-                         write_reason = f"batch size limit ({PARQUET_BATCH_SIZE}) reached"
-                    elif batch and current_time - last_write_time > 5:
-                         write_reason = f"time limit (5s) reached"
+                if evt.channel != "ticker":
+                    continue
 
-                    # Write batch if size reached or timeout
-                    if write_reason:
-                        if not batch: continue # Skip if batch became empty somehow
-                        batch_to_write = batch[:] # Create a copy for writing
-                        batch = [] # Clear original batch immediately
-                        logging.info(f"Attempting to write batch of {len(batch_to_write)} records (Reason: {write_reason})...")
+                for ev in evt.events:
+                    if ev.type != "update":
+                        continue
+                    for tk in ev.tickers:
+                        tk.parent_timestamp = evt.timestamp
+                        tk.parent_sequence_num = evt.sequence_num
+                        batch.append(tk)
 
-                        try:
-                            df = pd.DataFrame(batch_to_write)
-                            # Convert known numeric fields, handle errors gracefully
-                            for col in ['price', 'open_24h', 'volume_24h', 'low_24h', 'high_24h', 'volume_3d',
-                                        'best_bid', 'best_bid_size', 'best_ask', 'best_ask_size', 'last_size']:
-                                if col in df.columns:
-                                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                            # Convert time to datetime
-                            if 'time' in df.columns:
-                                df['time'] = pd.to_datetime(df['time'], errors='coerce')
+                now = time.monotonic()
+                need_flush = len(batch) >= PARQUET_BATCH_SIZE or (batch and now - last_write > 5)
 
-                            # Append/Create DataFrame to Parquet file
-                            if not parquet_file_exists:
-                                logging.debug(f"Executing df.to_parquet (creation) for {len(df)} rows...")
-                                df.to_parquet(PARQUET_FILE, engine='pyarrow', index=False)
-                                logging.info(f"Successfully CREATED Parquet file '{PARQUET_FILE}' with batch of {len(df)} records.")
-                                parquet_file_exists = True # Mark as existing now
-                            else:
-                                logging.debug(f"Executing df.to_parquet (append) for {len(df)} rows...")
-                                df.to_parquet(PARQUET_FILE, engine='pyarrow', append=True, index=False)
-                                logging.info(f"Successfully APPENDED batch of {len(df)} records to {PARQUET_FILE}")
-
-                            last_write_time = current_time
-                        except (pd.errors.ParserError, pyarrow.lib.ArrowInvalid, ValueError) as write_err:
-                             logging.error(f"Error processing or writing batch to Parquet: {write_err}. Skipping batch.")
-                        except Exception as write_err:
-                             logging.error(f"Unexpected error writing batch to Parquet: {write_err}. Skipping batch.")
-                             logging.error(f"Problematic batch head (first 5 records):\n{batch_to_write[:5]}")
-
-
-                except json.JSONDecodeError:
-                    logging.warning(f"Ignoring non-JSON frame: {frame[:100]}...")
-                except Exception as e:
-                    logging.error(f"Error processing frame: {e}")
+                if need_flush:
+                    _flush_batch(batch, writer, _output_file_path)
+                    if writer is None and batch:
+                        # writer created by _flush_batch
+                        writer = _flush_batch.writer  # type: ignore[attr-defined]
+                    last_write = now
         finally:
-            # Write any remaining records on exit
             if batch:
-                logging.info(f"Writing final batch of {len(batch)} records...")
-                batch_to_write = batch[:]
-                batch = [] # Clear original batch
-                try:
-                    df = pd.DataFrame(batch_to_write)
-                     # Convert known numeric fields, handle errors gracefully
-                    for col in ['price', 'open_24h', 'volume_24h', 'low_24h', 'high_24h', 'volume_3d',
-                                'best_bid', 'best_bid_size', 'best_ask', 'best_ask_size', 'last_size']:
-                        if col in df.columns:
-                            df[col] = pd.to_numeric(df[col], errors='coerce')
-                    if 'time' in df.columns:
-                        df['time'] = pd.to_datetime(df['time'], errors='coerce')
-
-                    # Write/Append logic for final batch
-                    if not parquet_file_exists:
-                        logging.debug(f"Executing df.to_parquet (creation) for final batch of {len(df)} rows...")
-                        df.to_parquet(PARQUET_FILE, engine='pyarrow', index=False)
-                        logging.info(f"Successfully CREATED Parquet file '{PARQUET_FILE}' with final batch of {len(df)} records.")
-                        parquet_file_exists = True # Mark as existing now
-                    else:
-                        logging.debug(f"Executing df.to_parquet (append) for final batch of {len(df)} rows...")
-                        df.to_parquet(PARQUET_FILE, engine='pyarrow', append=True, index=False)
-                        logging.info(f"Successfully APPENDED final batch of {len(df)} records to {PARQUET_FILE}")
-
-                except Exception as write_err:
-                     logging.error(f"Error writing final batch to Parquet: {write_err}")
-                     logging.error(f"Final batch head (first 5 records):\n{batch_to_write[:5]}")
-            else:
-                logging.info("No final batch to write.")
+                _flush_batch(batch, writer, _output_file_path)
+            if writer is not None:
+                writer.close()
+                logging.info("Closed Parquet file %s", _output_file_path)
 
 
-async def read_parquet_to_kafka() -> None:
-    """Read data from Parquet file and produce it to Kafka."""
-    kafka_producer = _get_producer()
-    if not PARQUET_FILE.exists():
-        logging.error(f"Parquet file not found at '{PARQUET_FILE}'")
+def _flush_batch(batch: list[TickerData], writer: pq.ParquetWriter | None, file_path: Path) -> None:
+    """Write the current `batch` as one row‑group and clear it."""
+    if not batch:
         return
 
-    logging.info(f"Reading from '{PARQUET_FILE}' and producing to Kafka topic '{KAFKA_TOPIC}'...")
+    records = [t.model_dump() for t in batch]
+    batch.clear()
+    table = pa.Table.from_pylist(records, schema=PARQUET_SCHEMA)
+
+    if writer is None:
+        _flush_batch.writer = pq.ParquetWriter(   # type: ignore[attr-defined]
+            file_path, table.schema, compression="snappy", use_dictionary=True
+        )
+        writer = _flush_batch.writer  # type: ignore[attr-defined]
+        logging.info("Created %s with schema (row‑group #1)", file_path)
+    writer.write_table(table)
+    logging.info("Wrote row‑group: %d rows (total bytes now ~%.1f MiB)",
+                 table.num_rows, file_path.stat().st_size / 2**20 if file_path.exists() else 0)
+
+# ────────────────────────────────────────── Mode 4: CB → JSON Lines ──
+async def stream_to_json() -> None:
+    if _output_file_path.exists():
+        logging.warning("%s already exists and will be **overwritten**.", _output_file_path)
+
     try:
-        df = pd.read_parquet(PARQUET_FILE, engine='pyarrow')
-        logging.info(f"Read {len(df)} records from Parquet.")
+        # Open in append mode with line buffering
+        with open(_output_file_path, "a+", encoding="utf-8", buffering=1) as f:
+            logging.info("Opened %s for writing JSON lines.", _output_file_path)
+            async with websockets.connect(WS_URL, ssl=ssl_ctx, ping_interval=20) as ws:
+                await ws.send(SUBSCRIBE_MSG)
+                logging.info("Subscribed; streaming JSON lines into %s", _output_file_path)
 
-        records_produced = 0
-        for record in df.to_dict('records'):
-             # Convert NaNs/NaTs to None for JSON compatibility
-             # Also convert Timestamp back to ISO 8601 string format if needed
-             record_cleaned = {}
-             for key, value in record.items():
-                 if pd.isna(value):
-                     record_cleaned[key] = None
-                 elif isinstance(value, pd.Timestamp):
-                      record_cleaned[key] = value.isoformat()
-                 else:
-                     record_cleaned[key] = value
+                async for frame in ws:
+                    try:
+                        evt = Event.model_validate_json(frame)
+                    except Exception as err:  # includes JSON/Pydantic errors
+                        logging.debug("Parse error ignored: %s", err)
+                        continue
 
-             try:
-                 kafka_producer.produce(KAFKA_TOPIC, value=json.dumps(record_cleaned).encode())
-                 records_produced += 1
-                 # Poll occasionally to prevent buffer buildup and handle delivery reports
-                 if records_produced % 1000 == 0:
-                     kafka_producer.poll(0)
-                     logging.info(f"Produced {records_produced} records...")
+                    if evt.channel != "ticker":
+                        continue
 
-             except BufferError:
-                 logging.warning("Kafka producer queue full. Flushing...")
-                 kafka_producer.flush() # Block until messages delivered/failed
-                 # Retry producing the message
-                 kafka_producer.produce(KAFKA_TOPIC, value=json.dumps(record_cleaned).encode())
-                 records_produced += 1
-             except Exception as e:
-                 logging.error(f"Error producing message to Kafka: {e}")
-                 logging.error(f"Problematic record: {record_cleaned}")
+                    for ev in evt.events:
+                        if ev.type != "update":
+                            continue
+                        for tk in ev.tickers:
+                            tk.parent_timestamp = evt.timestamp
+                            tk.parent_sequence_num = evt.sequence_num
+                            # Write each ticker as a JSON line
+                            f.write(tk.model_dump_json() + '\n')
 
-        logging.info(f"Finished producing {records_produced} records from Parquet to Kafka.")
-
-    except Exception as e:
-        logging.error(f"Error reading Parquet file or producing to Kafka: {e}")
+    except OSError as e:
+        logging.error("Error opening or writing to %s: %s", _output_file_path, e)
     finally:
-        logging.info("Flushing final Kafka messages...")
-        kafka_producer.flush() # Ensure all messages are sent before exiting
-        logging.info("Kafka flush complete.")
+        logging.info("Stopped writing JSON Lines to %s", _output_file_path)
 
-
-async def print_parquet_contents() -> None:
-    """Prints the Parquet file path and its first 100 rows as JSON lines."""
-    abs_path = PARQUET_FILE.resolve()
-    logging.info(f"Parquet file path: {abs_path}")
-
-    if not abs_path.exists():
-        logging.error("Error: Parquet file not found.")
+# ────────────────────────────────────────── Mode 3: Parquet → Kafka ──
+async def read_parquet_to_kafka() -> None:
+    if not _output_file_path.exists() or not _output_file_path.is_file():
+        logging.error("Parquet file %s not found or is not a file", _output_file_path)
         return
 
+    kafka = _get_producer()
+    df = pd.read_parquet(_output_file_path)
+    logging.info("Read %d rows; producing to Kafka …", len(df))
+
+    produced = 0
+    for record in df.to_dict("records"):
+        # JSON‑ify, handling NaN / Timestamp
+        record_clean: Dict[str, Any] = {}
+        for k, v in record.items():
+            if pd.isna(v):
+                record_clean[k] = None
+            elif isinstance(v, pd.Timestamp):
+                record_clean[k] = v.isoformat()
+            else:
+                record_clean[k] = v
+        kafka.produce(KAFKA_TOPIC, value=json.dumps(record_clean).encode())
+        produced += 1
+        if produced % 1000 == 0:
+            kafka.poll(0)
+    kafka.flush()
+    logging.info("Finished sending %d records", produced)
+
+# ────────────────────────────────────────── Mode 5: JSON Lines → Kafka ──
+async def read_json_to_kafka() -> None:
+    if not _output_file_path.exists() or not _output_file_path.is_file():
+        logging.error("JSON file %s not found or is not a file", _output_file_path)
+        return
+
+    kafka = _get_producer()
+    logging.info("Reading from %s and producing to Kafka topic '%s' ...", _output_file_path, KAFKA_TOPIC)
+
+    produced = 0
     try:
-        logging.info(f"Reading first 100 rows from {abs_path}...")
-        df = pd.read_parquet(abs_path, engine='pyarrow')
-        df_head = df.head(100)
+        with open(_output_file_path, "r", encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    # No need to parse, just send the raw JSON line
+                    kafka.produce(KAFKA_TOPIC, value=line.encode())
+                    produced += 1
+                    if produced % 1000 == 0:
+                        kafka.poll(0)
+                        logging.info("Produced %d records...", produced)
+                except json.JSONDecodeError:
+                    logging.warning("Skipping invalid JSON on line %d: %s", line_num, line[:100])
+                except Exception as e:
+                    logging.error("Error producing line %d: %s", line_num, e)
+                    # Decide whether to continue or stop on other errors
+                    # For now, log and continue
 
-        if df_head.empty:
-            logging.info("Parquet file is empty.")
-            return
+    except OSError as e:
+        logging.error("Error reading file %s: %s", _output_file_path, e)
+        return # Stop if we can't read the file
 
-        logging.info("--- Start of File Contents (first 100 rows as JSON) ---")
-        # Convert Timestamps to ISO format strings for JSON
-        for col in df_head.select_dtypes(include=['datetime64[ns]']).columns:
-            df_head[col] = df_head[col].dt.isoformat()
-        # Handle potential NaNs which are not valid JSON
-        json_output = df_head.to_json(orient='records', lines=True, date_format='iso', default_handler=str)
-        print(json_output) # Keep print here for direct output
-        logging.info("--- End of File Contents ---")
-        logging.info(f"Total rows in file: {len(df)}")
+    kafka.flush()
+    logging.info("Finished sending %d records from %s", produced, _output_file_path)
 
-    except Exception as e:
-        logging.error(f"Error reading or printing Parquet file: {e}")
+# ────────────────────────────────────────── Mode 6: CB → SQLite ──
+async def stream_to_sqlite() -> None:
+    batch: list[tuple] = []
+    conn: sqlite3.Connection | None = None
+    cursor: sqlite3.Cursor | None = None
+    last_commit = time.monotonic()
 
+    try:
+        conn = _get_sqlite_conn(_output_file_path)
+        cursor = conn.cursor()
+        logging.info("Opened SQLite DB %s and ensured table '%s' exists.", _output_file_path, _SQLITE_TABLE_NAME)
 
+        async with websockets.connect(WS_URL, ssl=ssl_ctx, ping_interval=20) as ws:
+            await ws.send(SUBSCRIBE_MSG)
+            logging.info("Subscribed; streaming records into %s", _output_file_path)
+
+            async for frame in ws:
+                try:
+                    evt = Event.model_validate_json(frame)
+                except Exception as err: # includes JSON/Pydantic errors
+                    logging.debug("Parse error ignored: %s", err)
+                    continue
+
+                if evt.channel != "ticker":
+                    continue
+
+                for ev in evt.events:
+                    if ev.type != "update":
+                        continue
+                    for tk in ev.tickers:
+                        tk.parent_timestamp = evt.timestamp
+                        tk.parent_sequence_num = evt.sequence_num
+                        # Convert Pydantic model to tuple for insertion
+                        # Ensure order matches _SQLITE_INSERT_SQL placeholders
+                        record_tuple = (
+                            tk.type,
+                            tk.product_id,
+                            tk.price,
+                            tk.volume_24_h,
+                            tk.low_24_h,
+                            tk.high_24_h,
+                            tk.low_52_w,
+                            tk.high_52_w,
+                            tk.price_percent_chg_24_h,
+                            tk.best_bid,
+                            tk.best_ask,
+                            tk.best_bid_quantity,
+                            tk.best_ask_quantity,
+                            tk.last_size,
+                            tk.volume_3d,
+                            tk.open_24h,
+                            tk.parent_timestamp,
+                            tk.parent_sequence_num,
+                        )
+                        batch.append(record_tuple)
+
+                now = time.monotonic()
+                # Commit based on batch size or time interval
+                need_commit = len(batch) >= 100 or (batch and now - last_commit > 5)
+
+                if need_commit and cursor and conn:
+                    try:
+                        cursor.executemany(_SQLITE_INSERT_SQL, batch)
+                        conn.commit()
+                        logging.info("Committed %d records to SQLite", len(batch))
+                        batch.clear()
+                        last_commit = now
+                    except sqlite3.Error as e:
+                        logging.error("SQLite insert/commit error: %s", e)
+                        # Consider rolling back or handling the error more robustly
+                        # For now, clear batch to prevent retrying faulty data
+                        batch.clear()
+
+    except sqlite3.Error as e:
+        logging.error("SQLite connection error: %s", e)
+    except OSError as e:
+        logging.error("Error accessing SQLite file %s: %s", _output_file_path, e)
+    finally:
+        # Final commit for any remaining items in batch
+        if batch and cursor and conn:
+            try:
+                cursor.executemany(_SQLITE_INSERT_SQL, batch)
+                conn.commit()
+                logging.info("Committed final %d records to SQLite", len(batch))
+            except sqlite3.Error as e:
+                logging.error("SQLite final commit error: %s", e)
+        if conn:
+            conn.close()
+            logging.info("Closed SQLite DB %s", _output_file_path)
+
+# ────────────────────────────────────────── Mode 7: SQLite → Kafka ──
+async def read_sqlite_to_kafka() -> None:
+    if not _output_file_path.exists() or not _output_file_path.is_file():
+        logging.error("SQLite file %s not found or is not a file", _output_file_path)
+        return
+
+    kafka = _get_producer()
+    logging.info("Reading from SQLite DB %s (table: %s) and producing to Kafka topic '%s' ...",
+                 _output_file_path, _SQLITE_TABLE_NAME, KAFKA_TOPIC)
+
+    produced = 0
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(_output_file_path)
+        conn.row_factory = sqlite3.Row # Fetch rows as dictionary-like objects
+        cursor = conn.cursor()
+
+        # Select all columns except the autoincrement id
+        column_names = [f.name for f in PARQUET_SCHEMA] # Use Arrow schema fields for consistency
+        query = f"SELECT {', '.join(column_names)} FROM {_SQLITE_TABLE_NAME}"
+        cursor.execute(query)
+
+        # Fetch rows in chunks to avoid loading large tables entirely into memory
+        fetch_size = 1000
+        while True:
+            rows = cursor.fetchmany(fetch_size)
+            if not rows:
+                break
+
+            for row in rows:
+                try:
+                    record_dict = dict(row)
+                    # Convert to JSON string for Kafka
+                    kafka.produce(KAFKA_TOPIC, value=json.dumps(record_dict).encode())
+                    produced += 1
+                    if produced % 1000 == 0:
+                        kafka.poll(0)
+                        logging.info("Produced %d records...", produced)
+                except Exception as e:
+                    logging.error("Error processing/producing row %s: %s", dict(row), e)
+                    # Log and continue
+
+    except sqlite3.Error as e:
+        logging.error("SQLite error while reading: %s", e)
+    except OSError as e:
+        logging.error("Error accessing SQLite file %s: %s", _output_file_path, e)
+    finally:
+        if conn:
+            conn.close()
+
+    kafka.flush()
+    logging.info("Finished sending %d records from SQLite DB %s", produced, _output_file_path)
+
+# ────────────────────────────────────────── Utility: print parquet ──
+async def print_parquet_contents() -> None:
+    if not _output_file_path.exists() or not _output_file_path.is_file():
+        logging.error("Parquet file not found or is not a file: %s", _output_file_path)
+        return
+    df = pd.read_parquet(_output_file_path)
+    head = df.head(100)
+    for col in head.select_dtypes(include=["datetime64[ns]"]).columns:
+        head[col] = head[col].dt.isoformat()
+    print(head.to_json(orient="records", lines=True, default_handler=str))
+    logging.info("Shown 100 / %d rows from %s", len(df), _output_file_path)
+
+# ────────────────────────────────────────── main ──
 async def main() -> None:
-    parser = argparse.ArgumentParser(description="Coinbase data streaming utility.")
-    parser.add_argument("-PF", "--print-file", action="store_true",
-                        help="Print Parquet file path and first 100 rows as JSON, then exit.")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("-k", "--kafka", action="store_true",
-                       help="Stream data directly from Coinbase to Kafka (default).")
-    group.add_argument("-F", "--file", action="store_true",
-                       help="Stream data from Coinbase and append to Parquet file.")
-    group.add_argument("-FK", "--file-to-kafka", action="store_true",
-                       help="Read data from Parquet file and send to Kafka.")
+    p = argparse.ArgumentParser(description="Coinbase ticker streaming utility")
+    p.add_argument("-PF", "--print-file", action="store_true",
+                   help="Print Parquet path + first 100 rows, then exit")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("-k", "--kafka", action="store_true", help="Stream Coinbase → Kafka (default)")
+    g.add_argument("-F", "--file", action="store_true", help="Stream Coinbase → Parquet file")
+    g.add_argument("-FK", "--file-to-kafka", action="store_true", help="Read Parquet → Kafka")
+    g.add_argument("-J", "--json", action="store_true", help="Stream Coinbase → JSON Lines file")
+    g.add_argument("-JK", "--json-to-kafka", action="store_true", help="Read JSON Lines file → Kafka")
+    g.add_argument("-S", "--sqlite", action="store_true", help="Stream Coinbase → SQLite database")
+    g.add_argument("-SK", "--sqlite-to-kafka", action="store_true", help="Read SQLite database → Kafka")
+    p.add_argument("-o", "--output-file", type=Path, default=None, # No default here anymore
+                   help="Input/Output file path for file/DB modes (-F, -J, -S, -FK, -JK, -SK, -PF). Default depends on mode.")
+    args = p.parse_args()
 
-    args = parser.parse_args()
+    # Determine mode first
+    mode = (
+        "file" if args.file else
+        "file_to_kafka" if args.file_to_kafka else
+        "json" if args.json else
+        "json_to_kafka" if args.json_to_kafka else
+        "sqlite" if args.sqlite else
+        "sqlite_to_kafka" if args.sqlite_to_kafka else
+        "kafka" # Default
+    )
 
-    # Handle -PF flag first
+    # Set the output file path based on mode and -o argument
+    global _output_file_path
+
+    requires_file_arg = mode in ["file", "file_to_kafka", "json", "json_to_kafka", "sqlite", "sqlite_to_kafka"] or args.print_file
+
+    if requires_file_arg:
+        if args.output_file:
+            _output_file_path = args.output_file
+        else:
+            # Assign default based on *output* mode if -o not given
+            if mode == "file":
+                _output_file_path = DEFAULT_PARQUET_FILE
+            elif mode == "json":
+                _output_file_path = DEFAULT_JSONL_FILE
+            elif mode == "sqlite":
+                _output_file_path = DEFAULT_SQLITE_FILE
+            else:
+                # Input modes require -o
+                logging.error(f"Mode '{mode}' requires an input file path specified with -o.")
+                return
+    elif args.output_file:
+        # -o provided but not needed for the mode (e.g., -k -o file.txt)
+        logging.warning(f"Ignoring -o/--output-file argument ('{args.output_file}') as it's not used in mode '{mode}'.")
+
     if args.print_file:
         await print_parquet_contents()
-        return # Exit after printing
+        return
 
-    # Determine mode if -PF was not used
-    mode = "kafka" # Default mode
-    if args.file:
-        mode = "file"
-    elif args.file_to_kafka:
-        mode = "file_to_kafka"
-
-    print(f"Selected mode: {mode}")
+    logging.info("Selected mode: %s", mode)
 
     if mode == "file_to_kafka":
-        # Run once, no retry loop
         await read_parquet_to_kafka()
-    else:
-        # Run streaming modes with retry loop and quit option
-        target_func = stream_to_parquet if mode == "file" else stream_to_kafka
-        backoff = 1
-        loop = asyncio.get_running_loop()
-        should_stop = False
+        return
+    if mode == "json_to_kafka":
+        await read_json_to_kafka()
+        return
+    if mode == "sqlite_to_kafka":
+        await read_sqlite_to_kafka()
+        return
 
-        logging.info(f"Starting stream mode '{mode}'. Press 'q' then Enter to quit gracefully.")
+    # Select target function for streaming modes
+    if mode == "file":
+        target = stream_to_parquet
+    elif mode == "json":
+        target = stream_to_json
+    elif mode == "sqlite":
+        target = stream_to_sqlite
+    else: # mode == "kafka" (default)
+        target = stream_to_kafka
 
-        while not should_stop:
-            stream_task = None
-            input_task = None
-            try:
-                logging.info(f"Attempting to connect and start streaming (backoff: {backoff}s)...")
-                stream_task = asyncio.create_task(target_func())
-                # Run blocking stdin read in executor
-                input_task = loop.run_in_executor(None, sys.stdin.readline)
+    # Check if _output_file_path is set for modes that need it
+    # (This check should technically be redundant due to the logic above, but adds safety)
+    if requires_file_arg and _output_file_path is None:
+        logging.error(f"Internal error: Output file path not set for mode '{mode}'.")
+        return
 
-                done, pending = await asyncio.wait(
-                    [stream_task, input_task],
-                    return_when=asyncio.FIRST_COMPLETED
-                )
+    backoff = 1
 
-                if input_task in done:
-                    user_input = await input_task # Get result from input task
-                    if user_input.strip().lower() == 'q':
-                        logging.info("'q' received. Shutting down gracefully...")
-                        should_stop = True
-                        if stream_task in pending:
-                            stream_task.cancel()
-                            try:
-                                await asyncio.wait_for(stream_task, timeout=10) # Wait for cancellation
-                            except (asyncio.TimeoutError, asyncio.CancelledError):
-                                logging.info("Stream task cancelled or timed out during shutdown.")
-                    else:
-                        logging.warning(f"Input '{user_input.strip()}' ignored. Press 'q' then Enter to quit.")
-                          # Restart loop immediately if non-'q' input received
-                        if stream_task in pending:
-                            stream_task.cancel() # Cancel current stream before restarting loop
-                            try:
-                                await asyncio.wait_for(stream_task, timeout=5)
-                            except (asyncio.TimeoutError, asyncio.CancelledError):
-                                logging.debug("Stream task cancelled or timed out during restart.")
-
-
-                if stream_task in done:
-                    # If stream task finished, it likely encountered an error
-                    try:
-                        await stream_task # Raise exception if one occurred
-                        # If no exception, stream ended unexpectedly
-                        logging.warning("Stream function finished unexpectedly. Will restart.")
-                        backoff = 1 # Reset backoff
-                    except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
-                        logging.warning(f"Websocket/Connection error: {exc!s}. Reconnecting in {backoff}s ...")
-                        await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, 60)
-                    except Exception as e: # Catch other potential errors from stream_task
-                        logging.error(f"Unexpected error in stream task: {e}. Restarting in {backoff}s...")
-                        await asyncio.sleep(backoff)
-                        backoff = min(backoff * 2, 60)
-
-            except KeyboardInterrupt:
-                logging.info("\nInterrupted by user (Ctrl+C). Exiting.")
-                should_stop = True
-            except asyncio.CancelledError:
-                logging.info("Stream task cancelled.")
-                should_stop = True # Ensure loop terminates if cancelled externally
-            except Exception as e:
-                logging.error(f"Unexpected error in main loop management: {e}. Restarting in {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60) # Also backoff on unexpected errors
-            finally:
-                # Cleanup tasks before next iteration or exit
-                if stream_task and not stream_task.done():
-                    stream_task.cancel()
-                    try:
-                        await asyncio.wait_for(stream_task, timeout=5.0)
-                    except asyncio.TimeoutError:
-                        logging.warning("Stream task did not cancel in time.")
-                    except asyncio.CancelledError:
-                        pass # Expected
-                if input_task and not input_task.done():
-                    # Input task is harder to cancel cleanly, but it's non-critical if it lingers
-                    # It might block the executor thread until newline is received
-                    pass
-                # Flush producer after each attempt/cycle or before exiting
-                if producer: # Only flush if producer was initialized
-                    logging.info("Flushing Kafka producer...")
-                    producer.flush(timeout=5)
-
-        logging.info("Exited streaming loop.")
-
+    while True:
+        try:
+            await target()
+            logging.warning("Stream ended unexpectedly; restarting in %ds", backoff)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            break
+        except (websockets.ConnectionClosedError, OSError) as exc:
+            logging.warning("Connection error: %s; reconnecting in %ds", exc, backoff)
+        except Exception as exc:
+            logging.error("Unexpected error: %s; retrying in %ds", exc, backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 60)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("\nMain loop interrupted. Exiting.")
-    finally:
-        # Final flush just in case
-        if producer: # Only flush if producer was initialized
-            logging.info("Final Kafka producer flush...")
-            producer.flush(timeout=10)
-        logging.info("Script finished.")
+        logging.info("Interrupted by user — shutting down …")
