@@ -9,11 +9,14 @@ Welcome to the Prague ML Fintech Workshop! This project provides a local develop
 *   [Prerequisites](#prerequisites)
 *   [Setup](#setup)
 *   [Environment Overview](#environment-overview)
+*   [Included Tools & Data Sources](#included-tools--data-sources)
 *   [Using the Flink CLI](#using-the-flink-cli)
 *   [Running PyFlink Jobs](#running-pyflink-jobs)
 *   [Workshop Goals & Potential Explorations](#workshop-goals--potential-explorations)
+*   [Next Steps / Going Further](#next-steps--going-further)
 *   [Troubleshooting](#troubleshooting)
 *   [Project Structure](#project-structure)
+*   [License](#license)
 
 ## Prerequisites
 
@@ -21,6 +24,11 @@ Welcome to the Prague ML Fintech Workshop! This project provides a local develop
 *   **Python:** Python 3.8+ is recommended. [Install Python](https://www.python.org/downloads/)
 *   **Git:** To clone this repository (if applicable).
 *   **Terminal/Command Prompt:** Basic familiarity with using a terminal.
+*   **Flink CLI:** Test the command-line interface (run from the project root):
+    ```bash
+    python flink_cli.py info
+    ```
+    You should see output detailing the Flink cluster status.
 
 ## Setup
 
@@ -80,6 +88,22 @@ The `pyflink/docker-compose.yml` file sets up the following services:
 *   `taskmanager`: Two Flink TaskManagers.
     *   **Volume Mount:** The project root directory (`./`) on your host machine is mounted to `/app` inside the TaskManager containers. This allows Flink jobs to access Python scripts and dependencies located anywhere in the project structure.
 
+## Included Tools & Data Sources
+
+This project includes helper tools and scripts:
+
+*   **`crypto_data/coinbase2parquet.py`:** A versatile Python script to fetch real-time ticker data from Coinbase Advanced Trade API via WebSocket.
+    *   Requires additional dependencies: `pip install websockets certifi confluent-kafka pandas pyarrow`
+    *   **Modes:**
+        *   `-k` (default): Stream data directly to the `coinbase-ticker` Kafka topic in the local Redpanda instance.
+        *   `-F`: Stream data and append it to a local Parquet file (`./coinbase_ticker_data.parquet` by default).
+        *   `-FK`: Read data *from* the local Parquet file and send it to the `coinbase-ticker` Kafka topic.
+        *   `-PF`: Print the full path to the Parquet file and its first 100 rows (if it exists), then exit.
+    *   Can be run concurrently with Flink jobs that consume from the `coinbase-ticker` topic.
+    *   Press `q` then Enter to gracefully stop streaming modes (`-k`, `-F`).
+
+*   **`flink_cli.py`:** A simple CLI for basic Flink cluster interactions (see next section).
+
 ## Using the Flink CLI
 
 The `flink_cli.py` script (located at the project root) provides basic interaction with the Flink cluster.
@@ -136,6 +160,13 @@ This environment serves as a foundation for:
 *   Anomaly detection.
 *   Simple rule-based signals.
 
+## Next Steps / Going Further
+
+*   **Try Flink on Confluent Cloud:** Experience a fully managed, scalable Flink service integrated with Kafka. [Learn More about Confluent Cloud for Apache Flink](https://www.confluent.io/flink/)
+*   **Explore Advanced Flink Features:** Investigate Table API/SQL, complex event processing (CEP), or asynchronous I/O.
+*   **Integrate More Data Sources:** Connect to other exchanges or financial data APIs.
+*   **Build More Sophisticated Models:** Implement more complex algorithms or ML models within your Flink jobs.
+
 ## Troubleshooting
 
 *   **Port Conflicts:** If `docker compose -f pyflink/docker-compose.yml up` fails due to port conflicts (8081, 8088, 9092), stop the conflicting application or change port mappings in `pyflink/docker-compose.yml`. Update `FLINK_REST_URL` for the CLI if needed.
@@ -155,10 +186,16 @@ This environment serves as a foundation for:
 ├── jobs/                   # Suggested location for your PyFlink job scripts
 │   └── (your scripts).py
 ├── flink_cli.py            # Python CLI tool for basic Flink interaction
+├── crypto_data/            # Scripts related to crypto data fetching/handling
+│   └── coinbase2parquet.py # Coinbase ticker data fetcher (Kafka/Parquet)
 ├── requirements.txt        # Python dependencies for flink_cli.py
 ├── venv/                   # Python virtual environment (optional)
 └── README.md               # This file - Main project documentation
 ```
+
+## License
+
+This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for details (if one exists) or visit [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0).
 
 ---
 Happy Streaming!

@@ -17,6 +17,7 @@ import ssl
 import time
 import sys
 import functools
+import logging
 from pathlib import Path
 from typing import NoReturn, List, Dict, Any
 
@@ -31,7 +32,7 @@ WS_URL = "wss://advanced-trade-ws.coinbase.com"
 KAFKA_TOPIC = "coinbase-ticker"
 PARQUET_FILE = Path("./coinbase_ticker_data.parquet")
 # Set batch size for writing to Parquet
-PARQUET_BATCH_SIZE = 100
+PARQUET_BATCH_SIZE = 50
 # List of product IDs to subscribe to
 PRODUCT_IDS = [
     "BTC-USD", "ETH-USD", "DOGE-USD", "XRP-USD",
@@ -53,12 +54,21 @@ SUBSCRIBE_MSG = json.dumps(
     }
 )
 
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout) # Log to standard output
+    ]
+)
+# --- End Logging Setup ---
 
 def _get_producer() -> Producer:
     """Creates or returns the existing Kafka producer."""
     global producer
     if producer is None:
-        print("Initializing Kafka producer...")
+        logging.info("Initializing Kafka producer...")
         producer = Producer({"bootstrap.servers": "localhost:19092"})
     return producer
 
@@ -68,7 +78,7 @@ async def stream_to_kafka() -> None:
     kafka_producer = _get_producer()
     async with websockets.connect(WS_URL, ssl=ssl_ctx, ping_interval=20) as ws:
         await ws.send(SUBSCRIBE_MSG)
-        print(f"Subscribed to ticker channel. Streaming to Kafka topic '{KAFKA_TOPIC}'...")
+        logging.info(f"Subscribed to ticker channel. Streaming to Kafka topic '{KAFKA_TOPIC}'...")
 
         async for frame in ws:
             try:
@@ -77,37 +87,68 @@ async def stream_to_kafka() -> None:
                 kafka_producer.poll(0)  # Non-blocking flush
                 # Optional: decode for logging
                 # data = json.loads(frame)
-                # print(f"Sent to Kafka: {data.get('product_id')} @ {data.get('price')}")
+                # logging.debug(f"Sent to Kafka: {data.get('product_id')} @ {data.get('price')}")
             except json.JSONDecodeError:
-                print(f"Ignoring non-JSON frame: {frame[:100]}...")
+                logging.warning(f"Ignoring non-JSON frame: {frame[:100]}...")
             except Exception as e:
-                print(f"Error producing to Kafka: {e}")
+                logging.error(f"Error producing to Kafka: {e}")
 
 
 async def stream_to_parquet() -> None:
     """Connect to WebSocket, subscribe, batch data, append to Parquet file."""
     batch: List[Dict[str, Any]] = []
     last_write_time = time.monotonic()
+    record_count = 0
+    # Check if the Parquet file already exists before starting
+    parquet_file_exists = PARQUET_FILE.exists()
+    if parquet_file_exists:
+        logging.info(f"Parquet file '{PARQUET_FILE}' already exists. Will append.")
+    else:
+        logging.info(f"Parquet file '{PARQUET_FILE}' does not exist. Will create on first batch.")
 
     async with websockets.connect(WS_URL, ssl=ssl_ctx, ping_interval=20) as ws:
         await ws.send(SUBSCRIBE_MSG)
-        print(f"Subscribed to ticker channel. Appending data to '{PARQUET_FILE}'...")
+        logging.info(f"Subscribed to ticker channel. Appending data to '{PARQUET_FILE}'...")
 
         try:
             async for frame in ws:
+                # logging.debug(f"Raw frame received: {frame[:200]}...") # Uncomment for verbose debugging
                 try:
                     data = json.loads(frame)
-                    # Ensure it's ticker data we expect (basic check)
-                    if data.get("type") == "ticker" and "product_id" in data:
-                        batch.append(data)
+                    # Ensure it's ticker data and flatten the structure
+                    if data.get("channel") == "ticker" and "events" in data:
+                        for event in data.get("events", []):
+                            if event.get("type") == "update" and "tickers" in event:
+                                for ticker_data in event.get("tickers", []):
+                                    if ticker_data.get("type") == "ticker" and "product_id" in ticker_data:
+                                        # Add the actual ticker data dictionary to the batch
+                                        # Include timestamp and sequence_num from the parent message if needed
+                                        ticker_data['parent_timestamp'] = data.get('timestamp')
+                                        ticker_data['parent_sequence_num'] = data.get('sequence_num')
+                                        batch.append(ticker_data)
+                                        record_count += 1
+                                        logging.debug(f"Added flattened record {record_count} ({ticker_data.get('product_id')}) to batch (current size: {len(batch)})")
+                            else:
+                                logging.debug(f"Ignoring event type '{event.get('type')}' or missing 'tickers' key in event: {event}")
+                    else:
+                        logging.debug(f"Ignoring message channel '{data.get('channel')}' or missing 'events' key. Data: {data}")
 
                     current_time = time.monotonic()
-                    # Write batch if size reached or timeout (e.g., 5 seconds)
-                    if len(batch) >= PARQUET_BATCH_SIZE or (batch and current_time - last_write_time > 5):
-                        if not batch: continue # Skip if batch became empty somehow
+                    write_reason = None
+                    if len(batch) >= PARQUET_BATCH_SIZE:
+                         write_reason = f"batch size limit ({PARQUET_BATCH_SIZE}) reached"
+                    elif batch and current_time - last_write_time > 5:
+                         write_reason = f"time limit (5s) reached"
 
-                        df = pd.DataFrame(batch)
+                    # Write batch if size reached or timeout
+                    if write_reason:
+                        if not batch: continue # Skip if batch became empty somehow
+                        batch_to_write = batch[:] # Create a copy for writing
+                        batch = [] # Clear original batch immediately
+                        logging.info(f"Attempting to write batch of {len(batch_to_write)} records (Reason: {write_reason})...")
+
                         try:
+                            df = pd.DataFrame(batch_to_write)
                             # Convert known numeric fields, handle errors gracefully
                             for col in ['price', 'open_24h', 'volume_24h', 'low_24h', 'high_24h', 'volume_3d',
                                         'best_bid', 'best_bid_size', 'best_ask', 'best_ask_size', 'last_size']:
@@ -117,31 +158,37 @@ async def stream_to_parquet() -> None:
                             if 'time' in df.columns:
                                 df['time'] = pd.to_datetime(df['time'], errors='coerce')
 
-                            # Append DataFrame to Parquet file
-                            df.to_parquet(PARQUET_FILE, engine='pyarrow', append=True, index=False)
-                            print(f"Appended batch of {len(batch)} records to {PARQUET_FILE}")
-                            batch = [] # Clear batch
+                            # Append/Create DataFrame to Parquet file
+                            if not parquet_file_exists:
+                                logging.debug(f"Executing df.to_parquet (creation) for {len(df)} rows...")
+                                df.to_parquet(PARQUET_FILE, engine='pyarrow', index=False)
+                                logging.info(f"Successfully CREATED Parquet file '{PARQUET_FILE}' with batch of {len(df)} records.")
+                                parquet_file_exists = True # Mark as existing now
+                            else:
+                                logging.debug(f"Executing df.to_parquet (append) for {len(df)} rows...")
+                                df.to_parquet(PARQUET_FILE, engine='pyarrow', append=True, index=False)
+                                logging.info(f"Successfully APPENDED batch of {len(df)} records to {PARQUET_FILE}")
+
                             last_write_time = current_time
                         except (pd.errors.ParserError, pyarrow.lib.ArrowInvalid, ValueError) as write_err:
-                             print(f"Error processing or writing batch to Parquet: {write_err}. Skipping batch.")
-                             print(f"Problematic batch head: {batch[:5]}")
-                             batch = [] # Clear problematic batch
+                             logging.error(f"Error processing or writing batch to Parquet: {write_err}. Skipping batch.")
                         except Exception as write_err:
-                             print(f"Unexpected error writing batch to Parquet: {write_err}. Skipping batch.")
-                             print(f"Problematic batch head: {batch[:5]}")
-                             batch = [] # Clear problematic batch
+                             logging.error(f"Unexpected error writing batch to Parquet: {write_err}. Skipping batch.")
+                             logging.error(f"Problematic batch head (first 5 records):\n{batch_to_write[:5]}")
 
 
                 except json.JSONDecodeError:
-                    print(f"Ignoring non-JSON frame: {frame[:100]}...")
+                    logging.warning(f"Ignoring non-JSON frame: {frame[:100]}...")
                 except Exception as e:
-                    print(f"Error processing frame: {e}")
+                    logging.error(f"Error processing frame: {e}")
         finally:
             # Write any remaining records on exit
             if batch:
-                print(f"Writing final batch of {len(batch)} records...")
-                df = pd.DataFrame(batch)
+                logging.info(f"Writing final batch of {len(batch)} records...")
+                batch_to_write = batch[:]
+                batch = [] # Clear original batch
                 try:
+                    df = pd.DataFrame(batch_to_write)
                      # Convert known numeric fields, handle errors gracefully
                     for col in ['price', 'open_24h', 'volume_24h', 'low_24h', 'high_24h', 'volume_3d',
                                 'best_bid', 'best_bid_size', 'best_ask', 'best_ask_size', 'last_size']:
@@ -150,23 +197,35 @@ async def stream_to_parquet() -> None:
                     if 'time' in df.columns:
                         df['time'] = pd.to_datetime(df['time'], errors='coerce')
 
-                    df.to_parquet(PARQUET_FILE, engine='pyarrow', append=True, index=False)
-                    print(f"Final batch appended to {PARQUET_FILE}")
+                    # Write/Append logic for final batch
+                    if not parquet_file_exists:
+                        logging.debug(f"Executing df.to_parquet (creation) for final batch of {len(df)} rows...")
+                        df.to_parquet(PARQUET_FILE, engine='pyarrow', index=False)
+                        logging.info(f"Successfully CREATED Parquet file '{PARQUET_FILE}' with final batch of {len(df)} records.")
+                        parquet_file_exists = True # Mark as existing now
+                    else:
+                        logging.debug(f"Executing df.to_parquet (append) for final batch of {len(df)} rows...")
+                        df.to_parquet(PARQUET_FILE, engine='pyarrow', append=True, index=False)
+                        logging.info(f"Successfully APPENDED final batch of {len(df)} records to {PARQUET_FILE}")
+
                 except Exception as write_err:
-                     print(f"Error writing final batch to Parquet: {write_err}")
-                     print(f"Final batch head: {batch[:5]}")
+                     logging.error(f"Error writing final batch to Parquet: {write_err}")
+                     logging.error(f"Final batch head (first 5 records):\n{batch_to_write[:5]}")
+            else:
+                logging.info("No final batch to write.")
 
 
 async def read_parquet_to_kafka() -> None:
     """Read data from Parquet file and produce it to Kafka."""
+    kafka_producer = _get_producer()
     if not PARQUET_FILE.exists():
-        print(f"Error: Parquet file not found at '{PARQUET_FILE}'")
+        logging.error(f"Parquet file not found at '{PARQUET_FILE}'")
         return
 
-    print(f"Reading from '{PARQUET_FILE}' and producing to Kafka topic '{KAFKA_TOPIC}'...")
+    logging.info(f"Reading from '{PARQUET_FILE}' and producing to Kafka topic '{KAFKA_TOPIC}'...")
     try:
         df = pd.read_parquet(PARQUET_FILE, engine='pyarrow')
-        print(f"Read {len(df)} records from Parquet.")
+        logging.info(f"Read {len(df)} records from Parquet.")
 
         records_produced = 0
         for record in df.to_dict('records'):
@@ -182,63 +241,63 @@ async def read_parquet_to_kafka() -> None:
                      record_cleaned[key] = value
 
              try:
-                 producer.produce(KAFKA_TOPIC, value=json.dumps(record_cleaned).encode())
+                 kafka_producer.produce(KAFKA_TOPIC, value=json.dumps(record_cleaned).encode())
                  records_produced += 1
                  # Poll occasionally to prevent buffer buildup and handle delivery reports
                  if records_produced % 1000 == 0:
-                     producer.poll(0)
-                     print(f"Produced {records_produced} records...")
+                     kafka_producer.poll(0)
+                     logging.info(f"Produced {records_produced} records...")
 
              except BufferError:
-                 print("Kafka producer queue full. Flushing...")
-                 producer.flush() # Block until messages delivered/failed
+                 logging.warning("Kafka producer queue full. Flushing...")
+                 kafka_producer.flush() # Block until messages delivered/failed
                  # Retry producing the message
-                 producer.produce(KAFKA_TOPIC, value=json.dumps(record_cleaned).encode())
+                 kafka_producer.produce(KAFKA_TOPIC, value=json.dumps(record_cleaned).encode())
                  records_produced += 1
              except Exception as e:
-                 print(f"Error producing message to Kafka: {e}")
-                 print(f"Problematic record: {record_cleaned}")
+                 logging.error(f"Error producing message to Kafka: {e}")
+                 logging.error(f"Problematic record: {record_cleaned}")
 
-        print(f"Finished producing {records_produced} records from Parquet to Kafka.")
+        logging.info(f"Finished producing {records_produced} records from Parquet to Kafka.")
 
     except Exception as e:
-        print(f"Error reading Parquet file or producing to Kafka: {e}")
+        logging.error(f"Error reading Parquet file or producing to Kafka: {e}")
     finally:
-        print("Flushing final Kafka messages...")
-        producer.flush() # Ensure all messages are sent before exiting
-        print("Kafka flush complete.")
+        logging.info("Flushing final Kafka messages...")
+        kafka_producer.flush() # Ensure all messages are sent before exiting
+        logging.info("Kafka flush complete.")
 
 
 async def print_parquet_contents() -> None:
     """Prints the Parquet file path and its first 100 rows as JSON lines."""
     abs_path = PARQUET_FILE.resolve()
-    print(f"Parquet file path: {abs_path}")
+    logging.info(f"Parquet file path: {abs_path}")
 
     if not abs_path.exists():
-        print("Error: Parquet file not found.")
+        logging.error("Error: Parquet file not found.")
         return
 
     try:
-        print(f"Reading first 100 rows from {abs_path}...")
+        logging.info(f"Reading first 100 rows from {abs_path}...")
         df = pd.read_parquet(abs_path, engine='pyarrow')
         df_head = df.head(100)
 
         if df_head.empty:
-            print("Parquet file is empty.")
+            logging.info("Parquet file is empty.")
             return
 
-        print("--- Start of File Contents (first 100 rows as JSON) ---")
+        logging.info("--- Start of File Contents (first 100 rows as JSON) ---")
         # Convert Timestamps to ISO format strings for JSON
         for col in df_head.select_dtypes(include=['datetime64[ns]']).columns:
             df_head[col] = df_head[col].dt.isoformat()
         # Handle potential NaNs which are not valid JSON
         json_output = df_head.to_json(orient='records', lines=True, date_format='iso', default_handler=str)
-        print(json_output)
-        print("--- End of File Contents ---")
-        print(f"Total rows in file: {len(df)}")
+        print(json_output) # Keep print here for direct output
+        logging.info("--- End of File Contents ---")
+        logging.info(f"Total rows in file: {len(df)}")
 
     except Exception as e:
-        print(f"Error reading or printing Parquet file: {e}")
+        logging.error(f"Error reading or printing Parquet file: {e}")
 
 
 async def main() -> None:
@@ -279,13 +338,13 @@ async def main() -> None:
         loop = asyncio.get_running_loop()
         should_stop = False
 
-        print(f"Starting stream mode '{mode}'. Press 'q' then Enter to quit gracefully.")
+        logging.info(f"Starting stream mode '{mode}'. Press 'q' then Enter to quit gracefully.")
 
         while not should_stop:
             stream_task = None
             input_task = None
             try:
-                print(f"Attempting to connect and start streaming (backoff: {backoff}s)...")
+                logging.info(f"Attempting to connect and start streaming (backoff: {backoff}s)...")
                 stream_task = asyncio.create_task(target_func())
                 # Run blocking stdin read in executor
                 input_task = loop.run_in_executor(None, sys.stdin.readline)
@@ -298,17 +357,23 @@ async def main() -> None:
                 if input_task in done:
                     user_input = await input_task # Get result from input task
                     if user_input.strip().lower() == 'q':
-                        print("'q' received. Shutting down gracefully...")
+                        logging.info("'q' received. Shutting down gracefully...")
                         should_stop = True
                         if stream_task in pending:
                             stream_task.cancel()
-                            await asyncio.wait([stream_task], timeout=10) # Wait for cancellation
+                            try:
+                                await asyncio.wait_for(stream_task, timeout=10) # Wait for cancellation
+                            except (asyncio.TimeoutError, asyncio.CancelledError):
+                                logging.info("Stream task cancelled or timed out during shutdown.")
                     else:
-                         print(f"Input '{user_input.strip()}' ignored. Press 'q' then Enter to quit.")
-                         # Restart loop immediately if non-'q' input received
-                         if stream_task in pending:
-                             stream_task.cancel() # Cancel current stream before restarting loop
-                             await asyncio.wait([stream_task], timeout=5)
+                        logging.warning(f"Input '{user_input.strip()}' ignored. Press 'q' then Enter to quit.")
+                          # Restart loop immediately if non-'q' input received
+                        if stream_task in pending:
+                            stream_task.cancel() # Cancel current stream before restarting loop
+                            try:
+                                await asyncio.wait_for(stream_task, timeout=5)
+                            except (asyncio.TimeoutError, asyncio.CancelledError):
+                                logging.debug("Stream task cancelled or timed out during restart.")
 
 
                 if stream_task in done:
@@ -316,27 +381,27 @@ async def main() -> None:
                     try:
                         await stream_task # Raise exception if one occurred
                         # If no exception, stream ended unexpectedly
-                        print("Stream function finished unexpectedly. Will restart.")
+                        logging.warning("Stream function finished unexpectedly. Will restart.")
                         backoff = 1 # Reset backoff
                     except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as exc:
-                        print(f"Websocket/Connection error: {exc!s}. Reconnecting in {backoff}s ...")
+                        logging.warning(f"Websocket/Connection error: {exc!s}. Reconnecting in {backoff}s ...")
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 60)
                     except Exception as e: # Catch other potential errors from stream_task
-                        print(f"Unexpected error in stream task: {e}. Restarting in {backoff}s...")
+                        logging.error(f"Unexpected error in stream task: {e}. Restarting in {backoff}s...")
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 60)
 
             except KeyboardInterrupt:
-                print("\nInterrupted by user (Ctrl+C). Exiting.")
+                logging.info("\nInterrupted by user (Ctrl+C). Exiting.")
                 should_stop = True
             except asyncio.CancelledError:
-                 print("Stream task cancelled.")
-                 should_stop = True # Ensure loop terminates if cancelled externally
+                logging.info("Stream task cancelled.")
+                should_stop = True # Ensure loop terminates if cancelled externally
             except Exception as e:
-                 print(f"Unexpected error in main loop management: {e}. Restarting in {backoff}s...")
-                 await asyncio.sleep(backoff)
-                 backoff = min(backoff * 2, 60) # Also backoff on unexpected errors
+                logging.error(f"Unexpected error in main loop management: {e}. Restarting in {backoff}s...")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60) # Also backoff on unexpected errors
             finally:
                 # Cleanup tasks before next iteration or exit
                 if stream_task and not stream_task.done():
@@ -344,29 +409,29 @@ async def main() -> None:
                     try:
                         await asyncio.wait_for(stream_task, timeout=5.0)
                     except asyncio.TimeoutError:
-                        print("Stream task did not cancel in time.")
+                        logging.warning("Stream task did not cancel in time.")
                     except asyncio.CancelledError:
                         pass # Expected
                 if input_task and not input_task.done():
                     # Input task is harder to cancel cleanly, but it's non-critical if it lingers
                     # It might block the executor thread until newline is received
-                     pass
+                    pass
                 # Flush producer after each attempt/cycle or before exiting
                 if producer: # Only flush if producer was initialized
-                    print("Flushing Kafka producer...")
+                    logging.info("Flushing Kafka producer...")
                     producer.flush(timeout=5)
 
-        print("Exited streaming loop.")
+        logging.info("Exited streaming loop.")
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nMain loop interrupted. Exiting.")
+        logging.info("\nMain loop interrupted. Exiting.")
     finally:
         # Final flush just in case
         if producer: # Only flush if producer was initialized
-            print("Final Kafka producer flush...")
+            logging.info("Final Kafka producer flush...")
             producer.flush(timeout=10)
-        print("Exited.")
+        logging.info("Script finished.")
