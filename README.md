@@ -1,6 +1,8 @@
-# Real-time Crypto Data Analysis with PyFlink & Redpanda
+# Real-time Crypto Data Analysis with Python Streaming Tools
 
-Welcome to the Prague ML Fintech Workshop! This project provides a local development environment using Docker Compose to explore real-time data analysis of cryptocurrency data using PyFlink, Apache Flink's Python API, and Redpanda, a Kafka-compatible streaming data platform.
+Welcome to the Prague ML Fintech Workshop! This project provides a local development environment using Docker Compose to explore real-time data analysis of cryptocurrency data. While this setup specifically uses PyFlink (Apache Flink's Python API) and Redpanda (a Kafka-compatible streaming data platform), the concepts and techniques explored are applicable across the broader Python streaming ecosystem.
+
+Python offers a growing number of powerful tools and platforms for stream processing, including managed services like [Ververica Cloud](https://www.ververica.com/cloud-trial) (from the original creators of Flink) and Quix Platform, as well as libraries like Faust, Bytewax, and standard Python concurrency models. This workshop uses PyFlink as a robust example for building stateful streaming applications.
 
 **Workshop Focus:** Analyzing real-time cryptocurrency market data (e.g., trades, order books) to build interesting models and derive insights using Python and PyFlink.
 
@@ -162,7 +164,7 @@ This environment serves as a foundation for:
 
 ## Next Steps / Going Further
 
-*   **Try Flink on Confluent Cloud:** Experience a fully managed, scalable Flink service integrated with Kafka. [Learn More about Confluent Cloud for Apache Flink](https://www.confluent.io/flink/)
+*   **Explore Ververica Cloud:** Dive into a comprehensive, enterprise-grade stream processing platform based on Apache Flink, built by the original creators of Flink. [Get Started with Ververica Cloud](https://www.ververica.com/cloud-trial)
 *   **Explore Advanced Flink Features:** Investigate Table API/SQL, complex event processing (CEP), or asynchronous I/O.
 *   **Integrate More Data Sources:** Connect to other exchanges or financial data APIs.
 *   **Build More Sophisticated Models:** Implement more complex algorithms or ML models within your Flink jobs.

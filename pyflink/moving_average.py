@@ -98,7 +98,7 @@ def main():
             .with_timestamp_assigner(lambda rec, ts: rec[2])
         )
         .key_by(lambda r: r[0])                           # product_id
-        .window(SlidingEventTimeWindows.of(Time.seconds(5), Time.seconds(1)))
+        .window(  SlidingEventTimeWindows.of(Time.seconds(5), Time.seconds(1)))
         .apply(MA5Window(), output_type=Types.STRING())
         .sink_to(sink)
     )

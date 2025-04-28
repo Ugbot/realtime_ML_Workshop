@@ -243,6 +243,8 @@ def generate_pyflink_run_command(
         border_style="green"
     ))
 
+    
+
 def main() -> None:
     # Declare FLINK_REST_URL as global at the start of the function
     global FLINK_REST_URL
