@@ -59,7 +59,14 @@ Python offers a growing number of powerful tools and platforms for stream proces
     ```
 
 3.  **Start the Docker Environment:**
-    This command needs to be run from the project root directory. It will look for the compose file in the `pyflink` subdirectory.
+    We will be starting 2 Docker Compose environments and these commands need to be run from the project root directory. It will look for the compose file in 2 project subdirectories.
+    
+    - Run Docker Compose in the `crypto_data` subdirectory.
+    ```bash
+    docker compose -f crypto_data/docker-compose.yml up -d
+    ```
+    
+    - Run Docker Compose in the `pyflink` subdirectory.
     ```bash
     docker compose -f pyflink/docker-compose.yml up -d
     ```
@@ -71,6 +78,7 @@ Python offers a growing number of powerful tools and platforms for stream proces
 
 4.  **Verify the Setup:**
     *   **Flink UI:** Open your web browser and navigate to [http://localhost:8088](http://localhost:8088). You should see the Apache Flink Dashboard.
+    *   **Redpanda UI:** Open your web browser and navigate to [http://localhost:8080](http://localhost:8080). You should see the Redpanda Console.
     *   **Redpanda (Optional):** Redpanda's Kafka API is at `localhost:9092` and the Schema Registry at `localhost:8081`.
     *   **Flink CLI:** Test the command-line interface (run from the project root):
         ```bash
@@ -80,11 +88,15 @@ Python offers a growing number of powerful tools and platforms for stream proces
 
 ## Environment Overview
 
+The `crypto_data/docker-compose.yml` file sets up the following service:
+*   `redpanda`: A single-node Redpanda cluster.
+    *   Kafka API: `localhost:9092` (from host), `redpanda:19092` (within Docker network)
+    *   Schema Registry: `localhost:8081` (from host), `redpanda:28081` (within Docker)
+*   `console`: A web console for the Redpanda cluster.
+    *   Web UI: `localhost:8080`
+
 The `pyflink/docker-compose.yml` file sets up the following services:
 
-*   `redpanda`: A single-node Redpanda cluster.
-    *   Kafka API: `localhost:9092` (from host), `redpanda:29092` (within Docker network)
-    *   Schema Registry: `localhost:8081` (from host), `redpanda:28081` (within Docker)
 *   `jobmanager`: The Flink JobManager.
     *   Flink UI / REST API: `http://localhost:8088` (from host), `jobmanager:8081` (within Docker)
 *   `taskmanager`: Two Flink TaskManagers.
