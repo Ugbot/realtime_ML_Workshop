@@ -23,14 +23,10 @@ Python offers a growing number of powerful tools and platforms for stream proces
 ## Prerequisites
 
 *   **Docker & Docker Compose:** Ensure you have Docker Desktop or Docker Engine with Compose installed and running. [Install Docker](https://docs.docker.com/get-docker/)
-*   **Python:** Python 3.8+ is recommended. [Install Python](https://www.python.org/downloads/)
+*   **Python:** Python 3.8+ is recommended but should be no later than 3.11.x for Flink compatibility. [Install Python](https://www.python.org/downloads/)
 *   **Git:** To clone this repository (if applicable).
 *   **Terminal/Command Prompt:** Basic familiarity with using a terminal.
-*   **Flink CLI:** Test the command-line interface (run from the project root):
-    ```bash
-    python flink_cli.py info
-    ```
-    You should see output detailing the Flink cluster status.
+
 
 ## Setup
 
