@@ -214,6 +214,7 @@ def main():
         .assign_timestamps_and_watermarks(watermarks)  # ← new strategy used
     )
 
+
     features = (
         parsed
         .key_by(lambda x: x[0], key_type=Types.STRING())  # keyed by product_id
