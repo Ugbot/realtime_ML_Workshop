@@ -75,7 +75,7 @@ Python offers a growing number of powerful tools and platforms for stream proces
 4.  **Verify the Setup:**
     *   **Flink UI:** Open your web browser and navigate to [http://localhost:8088](http://localhost:8088). You should see the Apache Flink Dashboard.
     *   **Redpanda UI:** Open your web browser and navigate to [http://localhost:8080](http://localhost:8080). You should see the Redpanda Console.
-    *   **Redpanda (Optional):** Redpanda's Kafka API is at `localhost:9092` and the Schema Registry at `localhost:8081`.
+    *   **Redpanda (Optional):** Redpanda's Kafka API is at `localhost:19092` and the Schema Registry at `localhost:8081`.
     *   **Flink CLI:** Test the command-line interface (run from the project root):
         ```bash
         python flink_cli.py info
@@ -86,7 +86,7 @@ Python offers a growing number of powerful tools and platforms for stream proces
 
 The `crypto_data/docker-compose.yml` file sets up the following service:
 *   `redpanda`: A single-node Redpanda cluster.
-    *   Kafka API: `localhost:9092` (from host), `redpanda:19092` (within Docker network)
+    *   Kafka API: `localhost:19092` (from host), `redpanda:19092` (within Docker network)
     *   Schema Registry: `localhost:8081` (from host), `redpanda:28081` (within Docker)
 *   `console`: A web console for the Redpanda cluster.
     *   Web UI: `localhost:8080`
