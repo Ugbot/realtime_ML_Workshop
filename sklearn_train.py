@@ -85,7 +85,7 @@ def main():
         KAFKA_SOURCE_TOPIC,
         bootstrap_servers=KAFKA_BROKER,
         group_id=KAFKA_GROUP_ID,
-        auto_offset_reset='earliest', # Start from beginning to get enough data
+                    auto_offset_reset='latest', # Start from latest messages for real-time training
         consumer_timeout_ms=60000 # Timeout after 60 seconds if no new messages
     )
 

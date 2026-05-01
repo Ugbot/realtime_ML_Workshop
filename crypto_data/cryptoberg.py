@@ -8,7 +8,6 @@ import pandas as pd
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 import dash
-from aiosignal import Signal
 from dash import dcc, html
 from dash.dependencies import Input, Output
 import plotly.graph_objects as go
@@ -26,7 +25,7 @@ lock = Lock()
 # Kafka config
 KAFKA_BOOTSTRAP = "localhost:19092"
 KAFKA_TOPIC = "coinbase-ticker"
-KAFKA_GROUP_ID = "aiokafka-group"
+KAFKA_GROUP_ID = "aiokafka-groupwww"
 KAFKA_SIGNALS_TOPIC = "trading-signals"
 SIGNAL_TYPES = ["CALL_BUY", "PUT_BUY", "CALL_SELL", "PUT_SELL"]
 
@@ -46,63 +45,81 @@ async def consume_kafka():
         bootstrap_servers=KAFKA_BOOTSTRAP,
         group_id=KAFKA_GROUP_ID,
         value_deserializer=lambda m: m.decode("utf-8"),
-        # auto_offset_reset= "earliest"
+        auto_offset_reset="latest",  # Use latest to skip the backlog and get current data
+
     )
     await consumer.start()
     try:
-        print(f"[*] Kafka consumer started on topic '{KAFKA_TOPIC}'...")
+        print(f"[*] Kafka consumer started on topic '{KAFKA_TOPIC}' with bootstrap servers: {KAFKA_BOOTSTRAP}")
+        print(f"[*] Using consumer group: {KAFKA_GROUP_ID}")
         async for msg in consumer:
-            data = json.loads(msg.value)
-            # {
-            #   "channel": "ticker",
-            #   "timestamp": "...",
-            #   "events": [{"tickers": [{"product_id": "...", "price": "...", ...}]}]
-            # }
-            if data.get("channel") == "ticker":
-                timestamp_str = data.get("timestamp", "")
-                events = data.get("events", [])
-                if events:
-                    tickers = events[0].get("tickers", [])
-                    if tickers:
-                        t = tickers[0]
-                        product_id = t.get("product_id")
-                        if product_id:
+            print(f"[DEBUG] Received message: {msg.value[:200]}...")  # Print first 200 chars
+            try:
+                data = json.loads(msg.value)
+                print(f"[DEBUG] Parsed data - channel: {data.get('channel')}")
+                # {
+                #   "channel": "ticker",
+                #   "timestamp": "...",
+                #   "events": [{"tickers": [{"product_id": "...", "price": "...", ...}]}]
+                # }
+                if data.get("channel") == "ticker":
+                    print(f"[DEBUG] Processing ticker data...")
+                    timestamp_str = data.get("timestamp", "")
+                    events = data.get("events", [])
+                    print(f"[DEBUG] Found {len(events)} events")
+                    if events:
+                        tickers = events[0].get("tickers", [])
+                        print(f"[DEBUG] Found {len(tickers)} tickers")
+                        if tickers:
+                            t = tickers[0]
+                            product_id = t.get("product_id")
                             price_str = t.get("price")
-                            with lock:
-                                # If new product_id, add a structure
-                                if product_id not in ticker_data:
-                                    ticker_data[product_id] = {
-                                        "ticks": [],
-                                        "latest": {}
-                                    }
-                                # Update the "latest" data
-                                ticker_data[product_id]["latest"] = t
+                            print(f"[DEBUG] Processing {product_id} at price {price_str}")
+                            if product_id:
+                                with lock:
+                                    # If new product_id, add a structure
+                                    if product_id not in ticker_data:
+                                        ticker_data[product_id] = {
+                                            "ticks": [],
+                                            "latest": {}
+                                        }
+                                        print(f"[DEBUG] Created new ticker_data entry for {product_id}")
+                                    # Update the "latest" data
+                                    ticker_data[product_id]["latest"] = t
 
-                                # Store raw tick
-                                if price_str:
-                                    try:
-                                        price = float(price_str)
+                                    # Store raw tick
+                                    if price_str:
                                         try:
-                                            dt = datetime.fromisoformat(timestamp_str.replace("Z", ""))
-                                        except ValueError:
-                                            dt = datetime.utcnow()
-                                        ticker_data[product_id]["ticks"].append((dt, price))
-                                    except ValueError:
-                                        pass
-                                print(f"[Kafka] {product_id} => {price_str}")
+                                            price = float(price_str)
+                                            try:
+                                                dt = datetime.fromisoformat(timestamp_str.replace("Z", ""))
+                                            except ValueError:
+                                                dt = datetime.utcnow()
+                                            ticker_data[product_id]["ticks"].append((dt, price))
+                                            print(f"[DEBUG] Added tick for {product_id}: {dt} => {price}")
+                                        except ValueError as e:
+                                            print(f"[ERROR] Failed to parse price {price_str}: {e}")
+                                    print(f"[Kafka] {product_id} => {price_str} (Total ticks: {len(ticker_data[product_id]['ticks'])})")
 
-                            # Generate trading signals
-                            signal = analyze_for_signals(
-                                product_id, 
-                                ticker_data[product_id]["ticks"]
-                            )
-                            if signal:
-                                # Publish signal to Kafka
-                                await producer.send_and_wait(
-                                    KAFKA_SIGNALS_TOPIC,
-                                    signal.to_json()
+                                # Generate trading signals
+                                signal = analyze_for_signals(
+                                    product_id, 
+                                    ticker_data[product_id]["ticks"]
                                 )
-                                print(f"[Signal] {product_id} => {signal.signal_type}")
+                                if signal:
+                                    # Publish signal to Kafka
+                                    await producer.send_and_wait(
+                                        KAFKA_SIGNALS_TOPIC,
+                                        signal.to_json()
+                                    )
+                                    print(f"[Signal] {product_id} => {signal.signal_type}")
+                else:
+                    print(f"[DEBUG] Ignoring non-ticker channel: {data.get('channel')}")
+            except Exception as e:
+                print(f"[ERROR] Failed to process message: {e}")
+                print(f"[ERROR] Raw message: {msg.value}")
+                import traceback
+                traceback.print_exc()
     finally:
         await consumer.stop()
         await producer.stop()
@@ -117,6 +134,25 @@ def start_consumer_loop():
         pass
     finally:
         loop.close()
+class Signal:
+    def __init__(self, product_id: str, signal_type: str, price: float,
+                 timestamp: datetime, confidence: float, metadata: Dict):
+        self.product_id = product_id
+        self.signal_type = signal_type
+        self.price = price
+        self.timestamp = timestamp
+        self.confidence = confidence
+        self.metadata = metadata
+
+    def to_json(self) -> Dict:
+        return {
+            "product_id": self.product_id,
+            "signal_type": self.signal_type,
+            "price": self.price,
+            "timestamp": self.timestamp.isoformat(),
+            "confidence": self.confidence,
+            "metadata": self.metadata
+        }
 
 # ---------------------------------------------------------
 # HELPER: BUILD STATS CARD
@@ -281,25 +317,6 @@ def analyze_for_signals(product_id: str, ticks: List[Tuple[datetime, float]]) ->
     return signal
 
 # Add these new types after the constants
-class Signal:
-    def __init__(self, product_id: str, signal_type: str, price: float, 
-                 timestamp: datetime, confidence: float, metadata: Dict):
-        self.product_id = product_id
-        self.signal_type = signal_type
-        self.price = price
-        self.timestamp = timestamp
-        self.confidence = confidence
-        self.metadata = metadata
-
-    def to_json(self) -> Dict:
-        return {
-            "product_id": self.product_id,
-            "signal_type": self.signal_type,
-            "price": self.price,
-            "timestamp": self.timestamp.isoformat(),
-            "confidence": self.confidence,
-            "metadata": self.metadata
-        }
 
 # ---------------------------------------------------------
 # DASH APP SETUP & LAYOUT
@@ -360,6 +377,10 @@ def update_dashboard(n, selected_range):
     """
     with lock:
         product_ids = sorted(ticker_data.keys())
+        print(f"[DASH DEBUG] Update #{n}: Found {len(product_ids)} products: {product_ids}")
+        for pid in product_ids:
+            tick_count = len(ticker_data[pid]["ticks"])
+            print(f"[DASH DEBUG] {pid}: {tick_count} ticks")
 
     rows = []
     for product_id in product_ids:
@@ -460,4 +481,4 @@ if __name__ == "__main__":
     consumer_thread.start()
 
     print("[*] Starting Dash app on http://127.0.0.1:8055")
-    app.run_server(debug=True, port=8055)
+    app.run(debug=True, port=8055)

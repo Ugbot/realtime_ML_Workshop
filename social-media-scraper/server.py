@@ -74,7 +74,7 @@ async def kafka_consumer():
         bootstrap_servers=kafka_bootstrap_servers,
         security_protocol='SSL',
         ssl_context=context,
-        auto_offset_reset="earliest",
+                    auto_offset_reset="latest",
         #    group_id="my-group"
     )
     await consumer.start()

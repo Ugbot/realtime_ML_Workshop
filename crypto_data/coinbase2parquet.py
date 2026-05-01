@@ -13,6 +13,11 @@ Modes:
   -S   : Stream Coinbase → SQLite database
   -SK  : Read SQLite database → Kafka
   -PF  : Print Parquet path + first 100 rows, then exit
+
+Serialization formats for Kafka:
+  --format json      : JSON serialization (default)
+  --format avro      : Avro serialization with Schema Registry
+  --format protobuf  : Protobuf serialization with Schema Registry
 """
 
 from __future__ import annotations
@@ -28,13 +33,16 @@ from pathlib import Path
 from typing import Any, Dict, List, NoReturn, Optional
 
 import certifi
-import pandas as pd                    # used for reading / printing only
-import pyarrow as pa                   # ← proper pyarrow import
-import pyarrow.parquet as pq
+import polars as pl
 import websockets                      # pip install websockets
 from confluent_kafka import Producer   # pip install confluent‑kafka
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer
+from confluent_kafka.schema_registry.protobuf import ProtobufSerializer
+from confluent_kafka.serialization import SerializationContext, MessageField
 from pydantic import BaseModel, Field, field_validator
 import sqlite3
+import fastavro
 
 # ───────────────────────────────────────── Configuration ──
 WS_URL = "wss://advanced-trade-ws.coinbase.com"
@@ -45,6 +53,7 @@ PARQUET_BATCH_SIZE = 50               # rows per row‑group
 DEFAULT_PARQUET_FILE = Path("./coinbase_ticker_data.parquet")
 DEFAULT_JSONL_FILE = Path("./coinbase_ticker_data.jsonl")
 DEFAULT_SQLITE_FILE = Path("./coinbase_ticker_data.db")
+DEFAULT_SCHEMA_REGISTRY_URL = "http://localhost:18081"
 PRODUCT_IDS = [
     "BTC-USD", "ETH-USD", "DOGE-USD", "XRP-USD",
     "LTC-USD", "BCH-USD", "ADA-USD", "SOL-USD",
@@ -111,27 +120,54 @@ class Event(BaseModel):
     sequence_num: Optional[int] = None
     events: List[Ticker]
 
-# ─────────────────────────────────────────────── Arrow schema ──
-PARQUET_SCHEMA = pa.schema([
-    pa.field("type", pa.string()),
-    pa.field("product_id", pa.string()),
-    pa.field("price", pa.float64()),
-    pa.field("volume_24_h", pa.float64()),
-    pa.field("low_24_h", pa.float64()),
-    pa.field("high_24_h", pa.float64()),
-    pa.field("low_52_w", pa.string()),
-    pa.field("high_52_w", pa.string()),
-    pa.field("price_percent_chg_24_h", pa.float64()),
-    pa.field("best_bid", pa.float64()),
-    pa.field("best_ask", pa.float64()),
-    pa.field("best_bid_quantity", pa.float64()),
-    pa.field("best_ask_quantity", pa.float64()),
-    pa.field("last_size", pa.float64()),
-    pa.field("volume_3d", pa.float64()),
-    pa.field("open_24h", pa.float64()),
-    pa.field("parent_timestamp", pa.string()),
-    pa.field("parent_sequence_num", pa.int64()),
-])
+# ─────────────────────────────────────────────── Avro schema ──
+AVRO_SCHEMA = {
+    "type": "record",
+    "name": "CoinbaseTicker",
+    "namespace": "com.coinbase.ticker",
+    "fields": [
+        {"name": "type", "type": "string"},
+        {"name": "product_id", "type": "string"},
+        {"name": "price", "type": "double"},
+        {"name": "volume_24_h", "type": "double"},
+        {"name": "low_24_h", "type": "double"},
+        {"name": "high_24_h", "type": "double"},
+        {"name": "low_52_w", "type": "string"},
+        {"name": "high_52_w", "type": "string"},
+        {"name": "price_percent_chg_24_h", "type": "double"},
+        {"name": "best_bid", "type": "double"},
+        {"name": "best_ask", "type": "double"},
+        {"name": "best_bid_quantity", "type": "double"},
+        {"name": "best_ask_quantity", "type": "double"},
+        {"name": "last_size", "type": ["null", "double"], "default": None},
+        {"name": "volume_3d", "type": ["null", "double"], "default": None},
+        {"name": "open_24h", "type": ["null", "double"], "default": None},
+        {"name": "parent_timestamp", "type": "string"},
+        {"name": "parent_sequence_num", "type": ["null", "long"], "default": None},
+    ]
+}
+
+# ─────────────────────────────────────────────── Polars schema ──
+POLARS_SCHEMA = {
+    "type": pl.String,
+    "product_id": pl.String,
+    "price": pl.Float64,
+    "volume_24_h": pl.Float64,
+    "low_24_h": pl.Float64,
+    "high_24_h": pl.Float64,
+    "low_52_w": pl.String,
+    "high_52_w": pl.String,
+    "price_percent_chg_24_h": pl.Float64,
+    "best_bid": pl.Float64,
+    "best_ask": pl.Float64,
+    "best_bid_quantity": pl.Float64,
+    "best_ask_quantity": pl.Float64,
+    "last_size": pl.Float64,
+    "volume_3d": pl.Float64,
+    "open_24h": pl.Float64,
+    "parent_timestamp": pl.String,
+    "parent_sequence_num": pl.Int64,
+}
 
 # ────────────────────────────────────────── SQLite setup ──
 _SQLITE_TABLE_NAME = "coinbase_ticker"
@@ -177,6 +213,12 @@ def _get_sqlite_conn(db_path: Path) -> sqlite3.Connection:
 # Global path, potentially updated by CLI args
 _output_file_path: Path | None = None # Will be set in main()
 
+# Global serialization configuration
+_serialization_format: str = "json"
+_schema_registry_client: SchemaRegistryClient | None = None
+_avro_serializer: AvroSerializer | None = None
+_protobuf_serializer: ProtobufSerializer | None = None
+
 # ───────────────────────────────────────── SSL + logging ──
 ssl_ctx = ssl.create_default_context(cafile=certifi.where())
 logging.basicConfig(
@@ -191,6 +233,61 @@ SUBSCRIBE_MSG = json.dumps({
     "product_ids": PRODUCT_IDS,
     "channel": "ticker",
 })
+
+# ───────────────────────────────────────── Serialization helpers ──
+def _init_schema_registry(url: str) -> None:
+    """Initialize Schema Registry client and serializers."""
+    global _schema_registry_client, _avro_serializer, _protobuf_serializer
+
+    if _schema_registry_client is None:
+        logging.info("Connecting to Schema Registry at %s", url)
+        _schema_registry_client = SchemaRegistryClient({"url": url})
+
+    if _serialization_format == "avro" and _avro_serializer is None:
+        logging.info("Initializing Avro serializer")
+        _avro_serializer = AvroSerializer(
+            _schema_registry_client,
+            json.dumps(AVRO_SCHEMA),
+            lambda obj, ctx: obj  # obj is already a dict
+        )
+
+    if _serialization_format == "protobuf" and _protobuf_serializer is None:
+        logging.info("Initializing Protobuf serializer")
+        # Import the generated protobuf module
+        try:
+            import coinbase_ticker_pb2
+            _protobuf_serializer = ProtobufSerializer(
+                coinbase_ticker_pb2.CoinbaseTicker,
+                _schema_registry_client,
+                conf={"use.deprecated.format": False}
+            )
+        except ImportError:
+            logging.error("Protobuf module not found. Run: protoc --python_out=. coinbase_ticker.proto")
+            raise
+
+def _serialize_message(data: dict) -> bytes:
+    """Serialize message based on configured format."""
+    if _serialization_format == "json":
+        return json.dumps(data).encode()
+    elif _serialization_format == "avro":
+        if _avro_serializer is None:
+            raise RuntimeError("Avro serializer not initialized")
+        ctx = SerializationContext(KAFKA_TOPIC, MessageField.VALUE)
+        return _avro_serializer(data, ctx)
+    elif _serialization_format == "protobuf":
+        if _protobuf_serializer is None:
+            raise RuntimeError("Protobuf serializer not initialized")
+        try:
+            import coinbase_ticker_pb2
+            # Convert dict to protobuf message
+            msg = coinbase_ticker_pb2.CoinbaseTicker(**data)
+            ctx = SerializationContext(KAFKA_TOPIC, MessageField.VALUE)
+            return _protobuf_serializer(msg, ctx)
+        except ImportError:
+            logging.error("Protobuf module not found")
+            raise
+    else:
+        raise ValueError(f"Unknown serialization format: {_serialization_format}")
 
 # ───────────────────────────────────────── Kafka producer ──
 producer: Producer | None = None
@@ -207,25 +304,52 @@ async def stream_to_kafka() -> None:
     kafka = _get_producer()
     async with websockets.connect(WS_URL, ssl=ssl_ctx, ping_interval=20) as ws:
         await ws.send(SUBSCRIBE_MSG)
-        logging.info("Subscribed; relaying raw frames to Kafka topic '%s'", KAFKA_TOPIC)
+        logging.info("Subscribed; streaming to Kafka topic '%s' (format: %s)", KAFKA_TOPIC, _serialization_format)
 
         async for frame in ws:
-            kafka.produce(KAFKA_TOPIC, value=frame.encode())
+            if _serialization_format == "json":
+                # For JSON, send raw frame
+                kafka.produce(KAFKA_TOPIC, value=frame.encode())
+            else:
+                # For Avro/Protobuf, parse and serialize
+                try:
+                    evt = Event.model_validate_json(frame)
+                except Exception as err:
+                    logging.debug("Parse error ignored: %s", err)
+                    continue
+
+                if evt.channel != "ticker":
+                    continue
+
+                for ev in evt.events:
+                    if ev.type != "update":
+                        continue
+                    for tk in ev.tickers:
+                        tk.parent_timestamp = evt.timestamp
+                        tk.parent_sequence_num = evt.sequence_num
+                        data = tk.model_dump()
+                        try:
+                            serialized = _serialize_message(data)
+                            kafka.produce(KAFKA_TOPIC, value=serialized)
+                        except Exception as e:
+                            logging.error("Serialization error: %s", e)
+                            continue
+
             kafka.poll(0)
             kafka.flush()
 
 # ────────────────────────────────────────── Mode 2: CB → Parquet ──
 async def stream_to_parquet() -> None:
     batch: list[TickerData] = []
-    writer: pq.ParquetWriter | None = None
     last_write = time.monotonic()
+    first_write = True
 
     if _output_file_path.exists():
         logging.warning("%s already exists and will be **overwritten** when this run starts writing.", _output_file_path)
 
     async with websockets.connect(WS_URL, ssl=ssl_ctx, ping_interval=20) as ws:
         await ws.send(SUBSCRIBE_MSG)
-        logging.info("Subscribed; streaming row‑groups into %s", _output_file_path)
+        logging.info("Subscribed; streaming into Parquet file %s", _output_file_path)
 
         try:
             async for frame in ws:
@@ -250,37 +374,37 @@ async def stream_to_parquet() -> None:
                 need_flush = len(batch) >= PARQUET_BATCH_SIZE or (batch and now - last_write > 5)
 
                 if need_flush:
-                    _flush_batch(batch, writer, _output_file_path)
-                    if writer is None and batch:
-                        # writer created by _flush_batch
-                        writer = _flush_batch.writer  # type: ignore[attr-defined]
+                    _flush_batch_polars(batch, _output_file_path, first_write)
+                    first_write = False
                     last_write = now
         finally:
             if batch:
-                _flush_batch(batch, writer, _output_file_path)
-            if writer is not None:
-                writer.close()
-                logging.info("Closed Parquet file %s", _output_file_path)
+                _flush_batch_polars(batch, _output_file_path, first_write)
+            logging.info("Closed Parquet file %s", _output_file_path)
 
 
-def _flush_batch(batch: list[TickerData], writer: pq.ParquetWriter | None, file_path: Path) -> None:
-    """Write the current `batch` as one row‑group and clear it."""
+def _flush_batch_polars(batch: list[TickerData], file_path: Path, first_write: bool) -> None:
+    """Write the current `batch` using Polars and clear it."""
     if not batch:
         return
 
     records = [t.model_dump() for t in batch]
     batch.clear()
-    table = pa.Table.from_pylist(records, schema=PARQUET_SCHEMA)
 
-    if writer is None:
-        _flush_batch.writer = pq.ParquetWriter(   # type: ignore[attr-defined]
-            file_path, table.schema, compression="snappy", use_dictionary=True
-        )
-        writer = _flush_batch.writer  # type: ignore[attr-defined]
-        logging.info("Created %s with schema (row‑group #1)", file_path)
-    writer.write_table(table)
-    logging.info("Wrote row‑group: %d rows (total bytes now ~%.1f MiB)",
-                 table.num_rows, file_path.stat().st_size / 2**20 if file_path.exists() else 0)
+    # Create Polars DataFrame
+    df = pl.DataFrame(records, schema=POLARS_SCHEMA)
+
+    # Write or append to Parquet
+    if first_write:
+        df.write_parquet(file_path, compression="snappy", use_pyarrow=False)
+        logging.info("Created %s with %d rows", file_path, len(df))
+    else:
+        # Append mode - read existing, concatenate, write
+        existing_df = pl.read_parquet(file_path)
+        combined_df = pl.concat([existing_df, df])
+        combined_df.write_parquet(file_path, compression="snappy", use_pyarrow=False)
+        logging.info("Appended %d rows (total: %d rows, %.1f MiB)",
+                     len(df), len(combined_df), file_path.stat().st_size / 2**20 if file_path.exists() else 0)
 
 # ────────────────────────────────────────── Mode 4: CB → JSON Lines ──
 async def stream_to_json() -> None:
@@ -326,24 +450,25 @@ async def read_parquet_to_kafka() -> None:
         return
 
     kafka = _get_producer()
-    df = pd.read_parquet(_output_file_path)
-    logging.info("Read %d rows; producing to Kafka …", len(df))
+    df = pl.read_parquet(_output_file_path)
+    logging.info("Read %d rows; producing to Kafka (format: %s) …", len(df), _serialization_format)
 
     produced = 0
-    for record in df.to_dict("records"):
-        # JSON‑ify, handling NaN / Timestamp
-        record_clean: Dict[str, Any] = {}
-        for k, v in record.items():
-            if pd.isna(v):
-                record_clean[k] = None
-            elif isinstance(v, pd.Timestamp):
-                record_clean[k] = v.isoformat()
-            else:
-                record_clean[k] = v
-        kafka.produce(KAFKA_TOPIC, value=json.dumps(record_clean).encode())
-        produced += 1
-        if produced % 1000 == 0:
-            kafka.poll(0)
+    for record in df.iter_rows(named=True):
+        # Convert None to actual None for serialization
+        record_clean = {k: (None if v is None else v) for k, v in record.items()}
+
+        try:
+            serialized = _serialize_message(record_clean)
+            kafka.produce(KAFKA_TOPIC, value=serialized)
+            produced += 1
+            if produced % 1000 == 0:
+                kafka.poll(0)
+                logging.info("Produced %d records...", produced)
+        except Exception as e:
+            logging.error("Error producing record: %s", e)
+            continue
+
     kafka.flush()
     logging.info("Finished sending %d records", produced)
 
@@ -532,11 +657,9 @@ async def print_parquet_contents() -> None:
     if not _output_file_path.exists() or not _output_file_path.is_file():
         logging.error("Parquet file not found or is not a file: %s", _output_file_path)
         return
-    df = pd.read_parquet(_output_file_path)
+    df = pl.read_parquet(_output_file_path)
     head = df.head(100)
-    for col in head.select_dtypes(include=["datetime64[ns]"]).columns:
-        head[col] = head[col].dt.isoformat()
-    print(head.to_json(orient="records", lines=True, default_handler=str))
+    print(head.write_json(row_oriented=True))
     logging.info("Shown 100 / %d rows from %s", len(df), _output_file_path)
 
 # ────────────────────────────────────────── main ──
@@ -552,9 +675,21 @@ async def main() -> None:
     g.add_argument("-JK", "--json-to-kafka", action="store_true", help="Read JSON Lines file → Kafka")
     g.add_argument("-S", "--sqlite", action="store_true", help="Stream Coinbase → SQLite database")
     g.add_argument("-SK", "--sqlite-to-kafka", action="store_true", help="Read SQLite database → Kafka")
-    p.add_argument("-o", "--output-file", type=Path, default=None, # No default here anymore
+    p.add_argument("-o", "--output-file", type=Path, default=None,
                    help="Input/Output file path for file/DB modes (-F, -J, -S, -FK, -JK, -SK, -PF). Default depends on mode.")
+    p.add_argument("--format", choices=["json", "avro", "protobuf"], default="json",
+                   help="Serialization format for Kafka messages (default: json)")
+    p.add_argument("--schema-registry-url", type=str, default=DEFAULT_SCHEMA_REGISTRY_URL,
+                   help=f"Schema Registry URL for Avro/Protobuf (default: {DEFAULT_SCHEMA_REGISTRY_URL})")
     args = p.parse_args()
+
+    # Set global serialization format
+    global _serialization_format
+    _serialization_format = args.format
+
+    # Initialize Schema Registry if using Avro or Protobuf
+    if _serialization_format in ["avro", "protobuf"]:
+        _init_schema_registry(args.schema_registry_url)
 
     # Determine mode first
     mode = (

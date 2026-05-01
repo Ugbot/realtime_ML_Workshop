@@ -200,5 +200,5 @@ if __name__ == '__main__':
     consumer_thread = threading.Thread(target=start_consumer_loop, daemon=True)
     consumer_thread.start()
 
-    print("[*] Starting Dash app on http://127.0.0.1:8050")
-    app.run(debug=True, use_reloader=False)
+    print("[*] Starting Dash app on http://127.0.0.1:8054")
+    app.run(debug=True, use_reloader=False, port=8084)

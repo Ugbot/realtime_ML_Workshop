@@ -24,7 +24,7 @@ ticker_data = {
 lock = Lock()
 
 # Kafka settings
-KAFKA_BOOTSTRAP = "localhost:9092"
+KAFKA_BOOTSTRAP = "localhost:19092"
 KAFKA_TOPIC = "coinbase-ticker"
 KAFKA_GROUP_ID = "aiokafka-group"
 
@@ -37,7 +37,7 @@ async def consume_kafka():
         bootstrap_servers=KAFKA_BOOTSTRAP,
         group_id=KAFKA_GROUP_ID,
         value_deserializer=lambda m: m.decode("utf-8"),
-        auto_offset_reset="earliest"
+        auto_offset_reset="latest"
     )
     await consumer.start()
     try:
@@ -296,4 +296,4 @@ if __name__ == "__main__":
     consumer_thread.start()
 
     print("[*] Starting Dash app on http://127.0.0.1:8050")
-    app.run_server(debug=True)
+    app.run(debug=True)

@@ -118,8 +118,8 @@ def main() -> None:
           .key_by(lambda r: r[0])
           .count_window(RSI_WINDOW+1, 1)                          # width 15 / slide 1 :contentReference[oaicite:3]{index=3}
           .process(RSI14(), output_type=Types.STRING())
-          .print()                                      # quick local view :contentReference[oaicite:4]{index=4}
-          # .sink_to(sink)
+          # .print()                                      # quick local view :contentReference[oaicite:4]{index=4}
+          .sink_to(sink)
     )
 
     env.execute("eth_usd_rsi14_simple")

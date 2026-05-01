@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package com.coinbase.ticker;
+
+message CoinbaseTicker {
+  string type = 1;
+  string product_id = 2;
+  double price = 3;
+  double volume_24_h = 4;
+  double low_24_h = 5;
+  double high_24_h = 6;
+  string low_52_w = 7;
+  string high_52_w = 8;
+  double price_percent_chg_24_h = 9;
+  double best_bid = 10;
+  double best_ask = 11;
+  double best_bid_quantity = 12;
+  double best_ask_quantity = 13;
+  optional double last_size = 14;
+  optional double volume_3d = 15;
+  optional double open_24h = 16;
+  string parent_timestamp = 17;
+  optional int64 parent_sequence_num = 18;
+}
