@@ -6,13 +6,13 @@ pipe every raw JSON frame straight into the `coinbase-ticker` Kafka topic.
 
 import asyncio
 import json
-import ssl
 import os
+import ssl
 from typing import NoReturn
 
 import certifi
-import websockets                       # pip install websockets
-from confluent_kafka import Producer    # pip install confluent-kafka
+import websockets  # pip install websockets
+from confluent_kafka import Producer  # pip install confluent-kafka
 
 WS_URL = "wss://advanced-trade-ws.coinbase.com"
 ssl_ctx = ssl.create_default_context(cafile=certifi.where())
@@ -22,14 +22,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 # ISO-8601 with optional fractional seconds, always UTC “Z”
-_ISO_UTC_RE = re.compile(
-    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$"
-)
+_ISO_UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
 
 def _iso_to_epoch_ms(iso_str: str) -> int:
     """Convert an ISO-8601 UTC string to epoch *milliseconds*."""
     ts = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
     return int(ts.replace(tzinfo=timezone.utc).timestamp() * 1_000)
+
 
 def convert_timestamps(obj: Any) -> Any:
     """
@@ -48,17 +48,21 @@ def convert_timestamps(obj: Any) -> Any:
             # Not a valid ISO timestamp after all – leave untouched
             return obj
     return obj
+
+
 class KafkaProducerWrapper:
     def __init__(self) -> None:
         ca_path = os.path.join(os.path.dirname(__file__), "ca.pem")
-        self.producer = Producer({
-            "bootstrap.servers": "kafka-vvp-aiven-ververica-e42c.c.aivencloud.com:13674",
-            "sasl.mechanism": "PLAIN",
-            "sasl.username": "avnadmin",
-            "sasl.password": "AVNS_v7liC0xcTBV5xVgy6i2",
-            "security.protocol": "SASL_SSL",
-            "ssl.ca.location": ca_path,
-        })
+        self.producer = Producer(
+            {
+                "bootstrap.servers": "kafka-vvp-aiven-ververica-e42c.c.aivencloud.com:13674",
+                "sasl.mechanism": "PLAIN",
+                "sasl.username": "avnadmin",
+                "sasl.password": "-----",
+                "security.protocol": "SASL_SSL",
+                "ssl.ca.location": ca_path,
+            }
+        )
 
     def produce(self, topic: str, value: bytes) -> None:
         self.producer.produce(topic, value=value)
@@ -66,6 +70,7 @@ class KafkaProducerWrapper:
 
     def flush(self) -> None:
         self.producer.flush()
+
 
 # Instantiate the producer wrapper
 kafka_producer = KafkaProducerWrapper()
@@ -75,10 +80,20 @@ SUBSCRIBE_MSG = json.dumps(
     {
         "type": "subscribe",
         "product_ids": [
-            "BTC-USD", "ETH-USD", "DOGE-USD", "XRP-USD",
-            "LTC-USD", "BCH-USD", "ADA-USD", "SOL-USD",
-            "DOT-USD", "LINK-USD", "XLM-USD", "UNI-USD",
-            "ALGO-USD", "MATIC-USD",
+            "BTC-USD",
+            "ETH-USD",
+            "DOGE-USD",
+            "XRP-USD",
+            "LTC-USD",
+            "BCH-USD",
+            "ADA-USD",
+            "SOL-USD",
+            "DOT-USD",
+            "LINK-USD",
+            "XLM-USD",
+            "UNI-USD",
+            "ALGO-USD",
+            "MATIC-USD",
         ],
         "channel": "ticker",
     }
@@ -96,7 +111,7 @@ async def stream() -> None:
             data = convert_timestamps(raw_data)  # normalise timestamps
             # Forward raw JSON to Kafka
             data = json.dumps(data, separators=(",", ":")).encode()
-            kafka_producer.produce("coinbase-ticker",         value=data)
+            kafka_producer.produce("coinbase-ticker", value=data)
 
             # Optional: decode for logging / downstream processing
             print("Received:", json.loads(data))
